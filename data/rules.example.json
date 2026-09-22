@@ -1,0 +1,30 @@
+[
+  {
+    "id": "failed_login_v1",
+    "version": "v1",
+    "revision": 1,
+    "name": "Failed password login (legacy v1 semantics)",
+    "condition": {"field": "fields.reason", "op": "eq", "value": "bad_password"},
+    "severity": "high"
+  },
+  {
+    "id": "brute_force_v2",
+    "version": "v2",
+    "revision": 1,
+    "name": "Repeated login failures with dedupe + suppression",
+    "condition": {"field": "event_type", "op": "eq", "value": "login_fail"},
+    "severity": "critical",
+    "dedupe_window_seconds": 300,
+    "suppress_key": "login_fail",
+    "suppress_severity_ceiling": "medium"
+  },
+  {
+    "id": "spike_v2",
+    "version": "v2",
+    "revision": 1,
+    "name": "Event counter spike (v2 numeric comparison)",
+    "condition": {"field": "fields.count", "op": "gte", "value": 100},
+    "severity": "high",
+    "dedupe_window_seconds": 60
+  }
+]

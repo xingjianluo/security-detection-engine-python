@@ -7,3 +7,9 @@ __pycache__/
 dist/
 build/
 *.egg-info/
+
+# detection runtime artifacts (example rules are kept)
+data/journal.log
+data/snapshot.json
+data/snapshot.json.tmp
+data/rules.json
