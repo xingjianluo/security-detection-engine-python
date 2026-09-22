@@ -1,0 +1,49 @@
+{
+  "format_version": 2,
+  "revision": 1,
+  "rules": [
+    {
+      "id": "ssh_bruteforce",
+      "name": "SSH 暴力破解（高优先级，命中后抑制窗口内中低级别事件）",
+      "event_type": "ssh_auth_failure",
+      "severity": "high",
+      "conditions": {
+        "all": [
+          {"field": "src_ip", "op": "prefix", "value": ""}
+        ]
+      },
+      "dedup_window_s": 300,
+      "correlation_key": ["src_ip", "user"],
+      "merge_key": ["rule_id", "src_ip"],
+      "suppress": {"window_s": 600, "max_severity": "medium"}
+    },
+    {
+      "id": "ssh_probe",
+      "name": "SSH 探测（低基线，可被高优先级告警抑制）",
+      "event_type": "ssh_auth_failure",
+      "severity": "low",
+      "conditions": {"any": [
+        {"field": "action", "op": "eq", "value": "probe"}
+      ]},
+      "dedup_window_s": 300,
+      "correlation_key": ["src_ip"],
+      "merge_key": ["rule_id", "src_ip"]
+    },
+    {
+      "id": "admin_login_impossible_travel",
+      "name": "管理员登录（结构化条件示例）",
+      "event_type": "login",
+      "severity": "medium",
+      "conditions": {"all": [
+        {"field": "user", "op": "eq", "value": "admin"},
+        {"any": [
+          {"field": "severity", "op": "gte", "value": "high"},
+          {"field": "src_ip", "op": "regex", "value": "^10\\."}
+        ]}
+      ]},
+      "dedup_window_s": 600,
+      "correlation_key": ["user", "src_ip"],
+      "merge_key": ["rule_id", "user"]
+    }
+  ]
+}

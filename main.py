@@ -1,6 +1,6 @@
-from fastapi import FastAPI
+from detector.api import create_app
 
-app = FastAPI()
+app = create_app()
 
 
 @app.get("/")

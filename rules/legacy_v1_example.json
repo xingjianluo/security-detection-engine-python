@@ -1,0 +1,14 @@
+{
+  "format_version": 1,
+  "revision": 1,
+  "rules": [
+    {
+      "id": "legacy_failed_login_threshold",
+      "name": "v1 旧格式规则：扁平阈值语义，在新版本下按原语义生效",
+      "event_type": "login_failure",
+      "min_severity": "medium",
+      "window_seconds": 120,
+      "enabled": true
+    }
+  ]
+}
