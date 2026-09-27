@@ -196,17 +196,91 @@ OPEN ──ack──> ACKNOWLEDGED ──resolve──> RESOLVED（终态）
 
 每条状态变更都产生一条流水（单调 `seq`），关键载荷：
 
-- `rules_published`：revision、rule_ids、`document_digest`
+- `rules_published`：revision、rule_ids、`document_digest`、**内嵌完整
+  规则 `rules`**（新流水自包含，重放不依赖 rules 目录原文；旧流水仅有
+  摘要时回退到 rules 目录按 digest 匹配）
 - `event_accepted`：event_id、`digest`、**完整归一事件**
 - `alert_opened` / `alert_suppressed` / `alert_dedup`：alert_id、
   `rule_id/rule_version/rule_revision`、`suppressed_by`、逐条 `checks`
 - `event_no_match` 及 ack/resolve/merge/reopen 等
+- `history_evicted`：淘汰记账（明细类型、水位、是否已归档），不属于
+  被归档的判定历史前缀
 
-重放（`engine.replay(journal_path, config)`）：
+重放（`engine.replay(journal_path, config, include_archive=False)`）：
 按 seq 重建规则历史 → 逐条重新判定 → 与原始流水比对
 （结论类型、命中规则版本、抑制归属、输入摘要），任何不一致抛
 `replay_mismatch`。`POST /api/v1/replay` 返回逐条报告。
+
+- **live-only（默认）**：只读当前本地流水。历史已淘汰到归档、其规则
+  原文或原始结论行不在本地时，对应条目登记 `reproducible:false` 并跳过，
+  不据此误报不一致；适用于“只核对当前仍保留的近期历史”。
+- **完整重放（`include_archive=True`）**：先按归档 manifest 顺序读入
+  全部归档分段，与当前流水拼成完整、按 seq 连续不重叠的判定历史再核对。
+  必须覆盖全部事件，缺段/损段/seq 重叠显式报错；用于用归档重建状态。
+
 快照恢复使用 `engine.restore_snapshot()` / `replay_from_snapshot()`。
+
+## 7.1 重启接续（无需开关）
+
+以相同启动方式 `uvicorn main:app`（即 `create_app(persist=True)` /
+`build_engine(..., persist=True)`）启动时自动完成，不需要额外开关或
+特殊调用：
+
+1. 原子加载 `snapshot.json`：事件明细、**幂等锚点 `seen`**、全部告警
+   （含活动/抑制/终态）、规则全部历史 revision、seq；
+2. 重放 `journal.jsonl` 中快照之后的流水尾（事件、ack/resolve/merge/
+   reopen 生命周期变更、规则发布），随后立即固化一次快照；
+3. 规则发布行若已随淘汰进入归档前缀，则从归档 manifest 只读补载规则，
+   **不**日常加载归档事件（其状态已在快照中）。
+
+因此重启后：
+
+- 重启前处理过的事件、告警、当前生效规则版本、去重与抑制窗口锚点都可
+  继续查询并参与后续判定；
+- 重复投递以前处理过的同一事件仍返回 `dedup_hit`（锚点永不淘汰），
+  不重复计数、不重复产生告警；
+- 可随时针对这段历史发起重放核对，结论与当初一致。
+
+直接 `Engine(Config())`（`persist=False`）的内部/测试构造行为保持不变。
+
+## 7.2 有界保留（拒绝 / 淘汰两条路径，结果可区分）
+
+对本地保留的**历史明细**设可配置总量上限（条数与字节，任一命中即满）：
+
+- 计入容量：归一事件明细、已**终态**（resolved/merged）告警明细、仍在
+  本地的判定流水；
+- **不计入容量、也永不淘汰**：幂等锚点（event_id→digest）、活动
+  （open/ack/suppressed 非终态）告警——它们是去重、合并、抑制与重复
+  投递判定的锚点。
+
+策略由 `retention_policy` 选择，两条路径从返回中明确区分：
+
+- `reject_new`：容量满时整批**事务性拒绝**，HTTP 503、原因码
+  `retention_full`，批次零写入；
+- `evict_oldest`（默认）：按最旧顺序淘汰事件明细/终态告警，每批返回
+  `evicted`（淘汰条数）与 `retention.records/bytes`（水位）。淘汰只动
+  历史明细：锚点与活动告警保留，因此不会出现计数漂移、把本该去重的
+  判成新事件、或让抑制结论变错。无可淘汰明细（只剩锚点）仍超限时，
+  显式抛 `retention_full`。
+
+## 7.3 归档（长期留存、按需纳入、不阻塞摄入）
+
+被淘汰的判定流水前缀落到 `archive_dir`（默认 `data/archive/`）长期保留：
+
+- 布局：`seg-00000001.jsonl …`（互不交叠的连续 seq 区间）+
+  `manifest.json`（提交点，原子替换）。边界清楚，日常查询/运行**不
+  加载归档**；
+- 写入：后台守护线程执行（快照式 fsync + `os.replace`，manifest 原子
+  提交），正常摄入不被阻塞；待归档目标有界（`archive_max_pending`），
+  IO 跟不上时摄入被显式拒绝（`archive_backpressure`），内存不膨胀；
+- 失败安全：任何写失败显式报 `archive_error`，不留半成品，当前可用状态
+  不受影响；未登记的孤儿分段在重启时删除（其数据仍在 journal 中）；
+  读取（重放/重建）缺段/损段显式抛 `archive_error`；
+- 崩溃安全：journal 前缀在归档 manifest 提交后才物理裁剪；提交点是
+  manifest 的原子替换，崩溃在其前后都不丢已处理状态；
+- 显式纳入：`replay(..., include_archive=True)` 或
+  `POST /api/v1/replay?include_archive=true` 把归档重新并入处理顺序，
+  逐条核对结果与没有归档时一致，每条判定仍可追溯命中规则版本与输入摘要。
 
 ## 8. 配置项（`detector/config.py`）
 
@@ -221,16 +295,29 @@ OPEN ──ack──> ACKNOWLEDGED ──resolve──> RESOLVED（终态）
 | `future_tolerance_s` | 300 | 允许的未来时钟漂移 |
 | `default_dedup_window_s` | 300 | 规则未声明时的去重窗口 |
 | `supported_rule_versions` | (1,2) | 接受的规则格式版本 |
-| `rules_dir` | `rules` | 启动自动加载与重放取规则原文的目录 |
+| `rules_dir` | `rules` | 启动自动加载与旧流水重放取规则原文的目录 |
 | `journal_path` / `snapshot_path` | `data/…` | 流水/快照位置 |
+| `snapshot_every` | 1000 | 每接受 N 条事件自动固化快照（0 关闭周期快照） |
+| `retention_max_records` | 100000 | 本地历史明细条数上限（事件+终态告警+流水） |
+| `retention_max_bytes` | 64 MiB | 本地历史明细序列化字节上限 |
+| `retention_policy` | `evict_oldest` | `evict_oldest` / `reject_new` |
+| `archive_enabled` | `True` | 淘汰明细是否落长期归档 |
+| `archive_dir` | `data/archive` | 归档目录（分段 + manifest） |
+| `archive_max_pending` | 8 | 待归档目标积压上限，满则 `archive_backpressure` |
+
+兼容范围：新增配置全部有默认值，既有 `Config()`/`Engine(...)`/
+`create_app(...)` 构造与既有接口、状态机、拒绝码行为保持不变；旧快照
+（无 `seen`/`event_seq` 字段）可直接恢复（锚点从事件明细补全）。
+`create_app()` 默认不开启持久化（沿用既有测试/嵌入行为），服务入口
+`main.py` 以 `create_app(persist=True)` 启动获得重启接续能力。
 
 ## 9. HTTP 接口
 
 | 方法/路径 | 说明 |
 |---|---|
 | `GET /` | 既有接口，保持 `{"Hello":"World"}` |
-| `GET /health` | 存活与统计 |
-| `POST /api/v1/events` | 批次摄入，body `{source, events:[…]}` |
+| `GET /health` | 存活与统计（含 `retention` / `archive` 状态） |
+| `POST /api/v1/events` | 批次摄入，body `{source, events:[…]}`；返回额外含 `evicted` 与 `retention` 水位 |
 | `GET /api/v1/events/{id}` | 事件查询 |
 | `POST /api/v1/rules` | 发布规则文档 `{document:{…}}`，返回新 revision |
 | `GET /api/v1/rules` | 当前生效规则集与 revision |
@@ -240,17 +327,19 @@ OPEN ──ack──> ACKNOWLEDGED ──resolve──> RESOLVED（终态）
 | `POST /api/v1/alerts/tick-suppress-expiry` | 抑制到期恢复 |
 | `GET /api/v1/journal` | 流水 |
 | `POST /api/v1/snapshot` | 原子写快照 |
-| `POST /api/v1/replay` | 流水重放并返回逐条核对报告 |
+| `POST /api/v1/replay?include_archive=` | 流水重放并逐条核对；`true` 时显式纳入归档做完整重建 |
 
-错误响应统一为 `{"error":{"code":…,"message":…}}`
-（422 校验类 / 503 背压 / 404 未找到）。
+错误响应统一为 `{"error":{"code":…,"message":…}}`：
+422 校验类 / 404 未找到 / **503 背压、`retention_full`、
+`archive_backpressure`（均可重试，原因码可区分）** /
+500 `archive_error`、`archive_disabled`。
 
 ## 10. 启动与验证
 
 ```bash
 uv sync --group dev
-uv run uvicorn main:app --port 8000        # 启动方式与既有服务一致
-uv run pytest -q                            # 24 个单测（含摘要/依据日志）
+uv run uvicorn main:app --port 8000        # 启动方式与既有服务一致（自动接续）
+uv run pytest -q                            # 全部单测（含摘要/依据日志）
 ```
 
 快速手工验证：
@@ -262,9 +351,37 @@ curl -s -XPOST localhost:8000/api/v1/events -H 'content-type: application/json' 
   "events":[{"event_id":"e1","type":"ssh_auth_failure","severity":"high",
              "timestamp":"2026-09-22T11:00:00Z","src_ip":"10.1.1.1","user":"bob"}]}'
 curl -s localhost:8000/api/v1/alerts | python -m json.tool
+# 重启服务后重复投递同一事件 -> dedup_hit=true；再请求完整重放：
+curl -s -XPOST 'localhost:8000/api/v1/replay?include_archive=true' | python -m json.tool
+```
+
+本地验证重启接续/有界保留/归档：
+
+```python
+from detector.config import Config
+from detector.engine import build_engine, replay
+cfg = Config(retention_max_records=100, retention_policy="evict_oldest")
+eng = build_engine(cfg, persist=True)      # 首次：自动加载规则
+eng.ingest_batch([...], source="generic_json")
+eng2 = build_engine(cfg, persist=True)     # 再次构建即“重启”，状态自动接续
+eng._archive.wait_idle()                  # 测试中等待归档落盘
+_eng, report = replay(cfg.journal_path, cfg, include_archive=True)  # 完整核对
 ```
 
 测试覆盖（`tests/`）：畸形事件归类、时间非法/迟到/未来、批次上限、
 v1/v2 兼容与显式拒绝、历史版本绑定、窗口边界（299/300s）、抑制优先级、
 合并归属、乱序计数、64 线程同 id 并发只生效一次、3200 并发事件无计数
-漂移、背压无部分写入、流水重放一致与篡改检测、HTTP 全流程。
+漂移、背压无部分写入、流水重放一致与篡改检测、HTTP 全流程，以及新增：
+
+- `test_restart_continuity.py`：相同启动方式重建后事件/告警/规则版本/
+  去重与抑制锚点接续、重启后重复投递仍判重、终态生命周期接续、重启后
+  重放核对一致；
+- `test_retention.py`：`reject_new`（503/`retention_full`/零写入）与
+  `evict_oldest`（`evicted>0`/水位回落/结果可区分）两条路径，淘汰后
+  幂等锚点与活动去重/抑制锚点不漂移，关闭归档时内联裁剪；
+- `test_archive.py`：淘汰/归档后纳入归档的完整重放与实时结论逐条一致
+  且可追溯规则版本与输入摘要、归档不阻塞摄入、归档缺段/损段/seq 重叠
+  显式报错。
+
+单测日志在 INFO 级别打印每条判定的**输入摘要（digest）与判定依据
+（命中规则、版本、checks）**，见 `tests/conftest.py` 的日志配置。

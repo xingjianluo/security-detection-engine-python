@@ -9,3 +9,4 @@ build/
 *.egg-info/
 data/*.jsonl
 data/*.json
+data/archive/

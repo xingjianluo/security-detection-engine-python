@@ -170,6 +170,11 @@ class BatchResult:
     rejected: list[EventResult] = field(default_factory=list)
     batch_rejected: bool = False
     batch_reason: str | None = None
+    # 有界保留：本批处理过程中触发的最旧淘汰条数（policy=evict_oldest）
+    evicted: int = 0
+    # 容量水位（便于调用方判断离上限还有多远）
+    retained_records: int = 0
+    retained_bytes: int = 0
 
 
 @dataclass(frozen=True)

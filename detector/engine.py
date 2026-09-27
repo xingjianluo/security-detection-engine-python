@@ -24,11 +24,13 @@ from typing import Any, Callable
 
 from . import alerts as alerts_mod
 from . import normalize, persistence, rules as rules_mod
+from .archive import ArchiveChunk, ArchiveWriter, read_manifest
 from .config import Config
 from .errors import (
     BackpressureError,
     BatchOverSizeError,
     BatchTooLargeError,
+    RetentionFullError,
     StaleEventError,
 )
 from .models import (
@@ -58,6 +60,17 @@ class Engine:
         # 待处理积压（摄入后尚未完成判定的计数），用于背压
         self._inflight = 0
         self._inflight_cond = threading.Condition(self._lock)
+        # 有界保留/归档
+        self._archive: ArchiveWriter | None = None
+        # 已提交（manifest 已含）归档水位；磁盘流水 <= 该水位的部分可裁剪
+        self._archived_watermark = 0
+        # 待提交归档目标水位集合，等待 ack
+        self._pending_commits: set[int] = set()
+        # 磁盘上已随快照落地的 seq；崩溃恢复时 journal 只重放其后的行
+        self._snapshot_seq = 0
+        self._events_since_snapshot = 0
+        if self._persist:
+            self._init_archive()
 
     # ------------------------------------------------------------------ #
     # 规则
@@ -81,7 +94,8 @@ class Engine:
             self._write_journal(
                 "rules_published",
                 {"revision": rev, "rule_ids": [r.rule_id for r in rules],
-                 "document_digest": input_digest(raw)},
+                 "document_digest": input_digest(raw),
+                 "rules": [rules_mod.rule_to_dict(r) for r in rules]},
             )
         log.info("rules published revision=%s rules=%s", rev, [r.rule_id for r in rules])
         return rev
@@ -111,7 +125,8 @@ class Engine:
                 "rules_published",
                 {"revision": rev, "rule_ids": [r.rule_id for r in rules],
                  "source": str(directory),
-                 "document_digest": input_digest(combined)},
+                 "document_digest": input_digest(combined),
+                 "rules": [rules_mod.rule_to_dict(r) for r in rules]},
             )
         return rev
 
@@ -155,13 +170,26 @@ class Engine:
         self._acquire_capacity(len(events))
         try:
             result = BatchResult()
+            with self._lock:
+                # reject_new：容量已满则整批事务性拒绝（原因明确，零写入）
+                self._enforce_reject_policy()
             for placeholder, reason, detail in rejected:
                 result.rejected.append(EventResult(
                     event_id=placeholder, outcome=EventOutcome.REJECTED,
                     reason=reason, detail=detail))
             # 4) 锁内逐条原子处理（时间窗校验 -> 幂等 -> 判定）
+            evicted_total = 0
             for event in events:
-                result.accepted.append(self._process_event(event))
+                with self._lock:
+                    outcome = self._process_event(event)
+                    if not outcome.dedup_hit and outcome.outcome is EventOutcome.ACCEPTED:
+                        self._maybe_auto_snapshot()
+                    # evict_oldest：本条处理后按容量淘汰最旧明细
+                    evicted_total += self._enforce_evict_oldest()
+                result.accepted.append(outcome)
+            result.evicted = evicted_total
+            result.retained_records = self.store.retained_count()
+            result.retained_bytes = self.store.retained_bytes()
             # 批次是否整体被拒（仅批次级异常路径会置位，此处保持 False）
             return result
         finally:
@@ -185,6 +213,93 @@ class Engine:
                             reason="backpressure_timeout",
                         )
             self._inflight += count
+
+    # ------------------------------------------------------------------ #
+    # 有界保留：容量检查 / 最旧淘汰 + 归档
+    # ------------------------------------------------------------------ #
+    def _over_limit(self) -> bool:
+        return (
+            self.store.retained_count() > self.config.retention_max_records
+            or self.store.retained_bytes() > self.config.retention_max_bytes
+        )
+
+    def _enforce_reject_policy(self) -> None:
+        """reject_new 策略：容量满则显式拒绝（批次事务性，不产生写入）。"""
+        if self.config.retention_policy == "reject_new" and self._over_limit():
+            raise RetentionFullError(
+                f"retention full: records={self.store.retained_count()}/"
+                f"{self.config.retention_max_records} "
+                f"bytes={self.store.retained_bytes()}/"
+                f"{self.config.retention_max_bytes}; rejected by policy",
+            )
+
+    def _enforce_evict_oldest(self) -> int:
+        """evict_oldest 策略：淘汰最旧明细直到回到上限内。
+
+        一次摄入触发的多次淘汰合并为一个归档分段（水位 = 最后一条被淘汰
+        明细的 seq，分段含其之前全部连续流水），避免高压小批次下归档
+        分段碎片化。活动告警与幂等锚点永不淘汰。
+        """
+        if self.config.retention_policy != "evict_oldest":
+            return 0
+        evicted: list = []
+        use_archive = self._persist and self.config.archive_enabled
+        while self._over_limit():
+            item = self.store.oldest_evictable()
+            if item is None or item.seq <= 0:
+                # 只剩锚点（不可淘汰）：无法腾出空间，显式拒绝
+                raise RetentionFullError(
+                    f"retention full with no evictable detail: "
+                    f"records={self.store.retained_count()} "
+                    f"bytes={self.store.retained_bytes()}",
+                )
+            self.store.remove_evicted(item)
+            evicted.append(item)
+        if not evicted:
+            return 0
+        if not evicted:
+            return 0
+        # 水位取这批淘汰完成时的当前最大流水 seq：被淘汰明细（事件/终态
+        # 告警）对应的结论行 seq 可能晚于其锚点 seq，水位必须覆盖这些结论
+        # 行，否则归档前缀里会出现“有 event_accepted 无结论”的破洞。
+        watermark = max(
+            max(item.seq for item in evicted),
+            self.store.current_journal_max_seq())
+        if use_archive:
+            # 明细已移除但流水前缀仍保留在内存/磁盘：目标水位排队后，后台
+            # 线程向引擎取 (committed, target] 区间行原子落分段；ack 后
+            # 才物理裁剪 journal。容量账立即释放（归档承接长期留存）。
+            self._archive.submit(watermark, self.config.archive_max_pending)
+            self.store.mark_archive_pending(watermark)
+        for item in evicted:
+            self._write_journal("history_evicted", {
+                "kind": item.kind, "key": item.key,
+                "watermark_seq": watermark, "archived": use_archive,
+            })
+            log.info("evicted oldest kind=%s key=%s watermark=%s archived=%s",
+                     item.kind, item.key, watermark, use_archive)
+        if not use_archive:
+            self.store.trim_journal(watermark)
+        else:
+            self._pending_commits.add(watermark)
+        return len(evicted)
+
+    def _on_archive_committed(self, chunk: ArchiveChunk) -> None:
+        """归档线程回调（引擎锁内执行）：推进水位、裁剪流水、固化快照。"""
+        with self._lock:
+            watermark = chunk.watermark_seq
+            if watermark <= self._archived_watermark:
+                return
+            self._archived_watermark = watermark
+            self._pending_commits.discard(watermark)
+            next_wm = max(self._pending_commits, default=0)
+            # 物理裁剪已提交部分；仍在排队的更高水位前缀容量账继续排除
+            self.store.trim_journal(watermark, next_pending_watermark=next_wm)
+            self._persist_journal_tail()
+            self.save_snapshot()
+            self._snapshot_seq = self.store._seq  # noqa: SLF001
+            log.info("archive committed watermark=%s pending=%s",
+                     watermark, self._pending_commits)
 
     def _check_time_window(self, event: Event) -> None:
         now = utcnow()
@@ -223,12 +338,13 @@ class Engine:
                                    outcome=EventOutcome.ACCEPTED,
                                    digest=event.digest, dedup_hit=True)
 
-            self._write_journal("event_accepted", {
+            entry = self._write_journal("event_accepted", {
                 "event_id": event.event_id, "source": event.source,
                 "digest": event.digest,
                 # 完整归一事件随流水保存，保证重放自包含、可复现
                 "event": event.to_dict(),
             })
+            self.store.bind_event_seq(event.event_id, entry.seq)
 
             # 规则判定（命中时版本）
             rules = self.store.active_rules()
@@ -300,43 +416,46 @@ class Engine:
         """重放路径：重建事件存储并重新判定，不做时间窗/幂等拦截。
 
         返回结论字典（kind ∈ no_match/dedup/opened/suppressed 及规则绑定）。
-        调用方负责持锁（本方法内部加锁）。
         """
         with self._lock:
-            self.store.put_event_if_absent(event)
-            rules = self.store.active_rules()
-            rule, trace = rules_mod.match_any(rules, event)
-            if rule is None:
-                return {"kind": "event_no_match"}
+            return self._replay_event_locked(event)
 
-            corr = alerts_mod.correlation_key_of(rule, event)
-            merge = alerts_mod.merge_key_of(rule, event)
-            existing = self.store.open_alert_by_keys(merge, corr)
-            if existing is not None and alerts_mod.should_dedup(existing, event, rule):
-                alerts_mod.fold_event(existing, event, trace)
-                self.store.update_alert(existing)
-                return {"kind": "alert_dedup", "alert_id": existing.alert_id,
-                        "rule_id": rule.rule_id, "rule_version": rule.version,
-                        "rule_revision": rule.revision}
+    def _replay_event_locked(self, event: Event) -> dict[str, Any]:
+        """调用方持锁的重放判定（恢复/归档重建共用）。"""
+        self.store.put_event_if_absent(event)
+        rules = self.store.active_rules()
+        rule, trace = rules_mod.match_any(rules, event)
+        if rule is None:
+            return {"kind": "event_no_match"}
 
-            candidate = alerts_mod.make_alert(rule, event, trace)
-            for suppressor in self.store.active_suppressors(event.occurred_at):
-                if suppressor.alert_id == candidate.alert_id:
-                    continue
-                if alerts_mod.suppression_blocks(suppressor, candidate.severity,
-                                                 event.occurred_at):
-                    candidate.state = AlertState.SUPPRESSED
-                    candidate.suppressed_by = suppressor.alert_id
-                    self.store.put_alert(candidate)
-                    return {"kind": "alert_suppressed",
-                            "alert_id": candidate.alert_id,
-                            "suppressed_by": suppressor.alert_id,
-                            "rule_id": rule.rule_id, "rule_version": rule.version,
-                            "rule_revision": rule.revision}
-            self.store.put_alert(candidate)
-            return {"kind": "alert_opened", "alert_id": candidate.alert_id,
+        corr = alerts_mod.correlation_key_of(rule, event)
+        merge = alerts_mod.merge_key_of(rule, event)
+        existing = self.store.open_alert_by_keys(merge, corr)
+        if existing is not None and alerts_mod.should_dedup(existing, event, rule):
+            alerts_mod.fold_event(existing, event, trace)
+            self.store.update_alert(existing)
+            return {"kind": "alert_dedup", "alert_id": existing.alert_id,
                     "rule_id": rule.rule_id, "rule_version": rule.version,
                     "rule_revision": rule.revision}
+
+        candidate = alerts_mod.make_alert(rule, event, trace)
+        for suppressor in self.store.active_suppressors(event.occurred_at):
+            if suppressor.alert_id == candidate.alert_id:
+                continue
+            if alerts_mod.suppression_blocks(suppressor, candidate.severity,
+                                             event.occurred_at):
+                candidate.state = AlertState.SUPPRESSED
+                candidate.suppressed_by = suppressor.alert_id
+                self.store.put_alert(candidate)
+                return {"kind": "alert_suppressed",
+                        "alert_id": candidate.alert_id,
+                        "suppressed_by": suppressor.alert_id,
+                        "rule_id": rule.rule_id, "rule_version": rule.version,
+                        "rule_revision": rule.revision}
+        self.store.put_alert(candidate)
+        return {"kind": "alert_opened", "alert_id": candidate.alert_id,
+                "rule_id": rule.rule_id, "rule_version": rule.version,
+                "rule_revision": rule.revision}
 
     def merge_alert(self, child_alert_id: str, parent_alert_id: str) -> Alert:
         """显式合并：child -> MERGED（终态），归属 parent。"""
@@ -352,8 +471,9 @@ class Engine:
             alerts_mod.transition(child, AlertState.MERGED)
             child.merged_into = parent_alert_id
             self.store.update_alert(child)
-            self._write_journal("alert_merged", {
+            entry = self._write_journal("alert_merged", {
                 "alert_id": child_alert_id, "merged_into": parent_alert_id})
+            self.store.bind_alert_seq(child_alert_id, entry.seq)
             return child
 
     # ------------------------------------------------------------------ #
@@ -372,7 +492,8 @@ class Engine:
             alert = self._require_alert(alert_id)
             alerts_mod.transition(alert, AlertState.RESOLVED)
             self.store.update_alert(alert)
-            self._write_journal("alert_resolved", {"alert_id": alert_id})
+            entry = self._write_journal("alert_resolved", {"alert_id": alert_id})
+            self.store.bind_alert_seq(alert_id, entry.seq)
             return alert
 
     def reopen(self, alert_id: str) -> Alert:
@@ -447,11 +568,243 @@ class Engine:
                 "rule_revision": self.store.current_revision(),
                 "inflight": self._inflight,
                 "journal": self.store.journal_len(),
+                "retention": {
+                    "records": self.store.retained_count(),
+                    "bytes": self.store.retained_bytes(),
+                    "max_records": self.config.retention_max_records,
+                    "max_bytes": self.config.retention_max_bytes,
+                    "policy": self.config.retention_policy,
+                },
+                "archive": {
+                    "enabled": self._archive is not None,
+                    "committed_watermark": self._archived_watermark,
+                    "pending_targets": (
+                        self._archive.pending if self._archive else 0),
+                    "healthy": (
+                        self._archive.failed is None
+                        if self._archive else True),
+                },
             }
 
     # ------------------------------------------------------------------ #
     # 持久化
     # ------------------------------------------------------------------ #
+    # ------------------------------------------------------------------ #
+    # 持久化：重启接续
+    # ------------------------------------------------------------------ #
+    def _init_archive(self) -> None:
+        """启动归档器并从 manifest 得知已提交水位（不加载归档内容）。"""
+        if not self.config.archive_enabled:
+            return
+        archive_dir = self.config.archive_dir or (
+            self.config.data_dir / "archive")
+        try:
+            writer = ArchiveWriter(
+                archive_dir,
+                fetch_entries=self._fetch_archivable_entries,
+                on_commit=self._on_archive_committed)
+            writer.start()
+        except Exception:
+            raise
+        self._archive = writer
+        self._archived_watermark = writer.committed_watermark()
+
+    def _fetch_archivable_entries(self, prev_watermark: int,
+                                  target_watermark: int):
+        """供归档线程调用：取 (prev, target] 区间仍在本地流水中的判定历史。
+
+        ``history_evicted`` 是淘汰记账行（seq 位于淘汰点之后，不属于被
+        归档的判定历史），排除在外，保证分段严格等于某水位之前的连续前缀。
+        """
+        with self._lock:
+            return [
+                e for e in self.store.journal()
+                if prev_watermark < e.seq <= target_watermark
+                and e.kind != "history_evicted"]
+
+    def restore_on_startup(self) -> bool:
+        """从本地快照 + 流水恢复，实现重启接续（无需开关/特殊调用）。
+
+        快照承载当前状态（含幂等锚点、活动告警、规则历史、seq），流水
+        承载快照之后的状态变更；规则发布若已落入归档前缀，则从 manifest
+        只读地补载（归档事件不日常加载）。
+        返回是否发生了恢复。
+        """
+        if not self._persist:
+            return False
+        data = persistence.load_snapshot(self.config.snapshot_path)
+        restored = False
+        if data is not None:
+            with self._lock:
+                self.store.restore(data)
+                self._snapshot_seq = self.store._seq  # noqa: SLF001
+            restored = True
+        rows = persistence.read_journal(self.config.journal_path)
+        # 已归档前缀里的 rules_published 可能本地流水已裁剪；从归档补载规则，
+        # 但不重放归档事件（其状态已由快照承载）。
+        archived_rule_rows: list[dict] = []
+        if self._archive is not None:
+            try:
+                archived_rule_rows = [
+                    r for r in self._archive.read_archived_rows()
+                    if r.get("kind") == "rules_published"]
+            except Exception:
+                archived_rule_rows = []
+        with self._lock:
+            self._apply_recovery_rows(
+                archived_rule_rows, after_seq=self._snapshot_seq,
+                events_only=False)
+            tail_rows = [r for r in rows if r["seq"] > self._snapshot_seq]
+            self._apply_recovery_rows(rows, after_seq=self._snapshot_seq)
+            # 内存流水重建磁盘上尚未被已提交归档覆盖的全部行：它们要么是
+            # 快照之后的判定尾，要么是崩溃前已淘汰、分段未提交而待补归档的
+            # 前缀（排除淘汰记账行）。这样 fetch/裁剪都基于完整 live 集合。
+            committed = self._archived_watermark
+            live_disk_rows = [
+                r for r in rows
+                if int(r["seq"]) > committed and r.get("kind") != "history_evicted"
+            ]
+            self._rehydrate_journal(live_disk_rows)
+            if tail_rows:
+                # 流水尾重放完立即固化快照，使磁盘流水可安全裁剪为当前尾巴；
+                # 之后再次崩溃也只需从这份快照恢复。
+                self.save_snapshot()
+                self._snapshot_seq = self.store._seq  # noqa: SLF001
+
+        # 崩溃恢复：明细已淘汰、分段也已入队但 manifest 未提交的水位会丢。
+        # 磁盘 journal 里仍保留这些行；把“已提交归档水位之外、且属于已淘汰
+        # 明细”的连续前缀重新补归档，使归档覆盖与淘汰状态重新一致。
+        self._rearchive_orphaned_prefix(rows)
+        if restored or rows:
+            log.info(
+                "startup recovery: snapshot=%s tail_rows=%d events=%d "
+                "alerts=%d revision=%s",
+                restored,
+                sum(1 for r in rows if r["seq"] > self._snapshot_seq),
+                self.store.seen_count(), len(self.store.all_alerts()),
+                self.store.current_revision())
+        return restored or bool(rows)
+
+    def _apply_recovery_rows(self, rows: list[dict], *, after_seq: int = 0,
+                             events_only: bool = True) -> None:
+        """按 seq 顺序把流水行应用到当前 store（重启恢复/快照尾重放）。
+
+        ``events_only=True``（默认）应用事件与生命周期行；``False`` 只
+        用于从归档补载规则发布行（归档事件不日常加载）。
+        """
+        for row in sorted(rows, key=lambda r: r["seq"]):
+            seq = int(row["seq"])
+            if events_only and seq <= after_seq:
+                continue
+            kind, payload = row["kind"], row.get("payload", {})
+            if kind == "rules_published":
+                rev = int(payload["revision"])
+                if rev in self.store.rule_revisions():
+                    continue
+                raws = payload.get("rules")
+                if not raws:
+                    # 旧流水未内嵌规则：恢复时跳过（规则应由快照承载）
+                    continue
+                self.store.publish_rules(
+                    rev, [rules_mod.rule_from_dict(r, revision=rev) for r in raws])
+                self._store_seq_if_newer(seq)
+                continue
+            if not events_only:
+                continue
+            if kind == "event_accepted":
+                event = _event_from_journal(payload)
+                if self.store.put_event_if_absent(event):
+                    self.store.bind_event_seq(event.event_id, seq)
+                    self._replay_event_locked(event)
+                self._store_seq_if_newer(seq)
+            elif kind in (
+                "alert_acknowledged", "alert_resolved", "alert_reopened",
+                    "alert_merged"):
+                self._apply_lifecycle_row(kind, payload)
+                self._store_seq_if_newer(seq)
+            else:
+                self._store_seq_if_newer(seq)
+
+    def _store_seq_if_newer(self, seq: int) -> None:
+        if seq > self.store._seq:  # noqa: SLF001
+            self.store._seq = seq  # noqa: SLF001
+
+    def _apply_lifecycle_row(self, kind: str, payload: dict) -> None:
+        alert_id = payload.get("alert_id")
+        alert = self.store.get_alert(alert_id)
+        if alert is None:
+            return
+        if kind == "alert_acknowledged":
+            alerts_mod.transition(alert, AlertState.ACKNOWLEDGED)
+        elif kind == "alert_resolved":
+            alerts_mod.transition(alert, AlertState.RESOLVED)
+        elif kind == "alert_reopened":
+            alerts_mod.transition(alert, AlertState.OPEN)
+            alert.suppressed_by = None
+        elif kind == "alert_merged":
+            alerts_mod.transition(alert, AlertState.MERGED)
+            alert.merged_into = payload.get("merged_into")
+        self.store.update_alert(alert)
+
+    def _persist_journal_tail(self) -> None:
+        """用当前内存中仍保留的流水原子替换磁盘流水（归档裁剪后）。"""
+        if not self._persist:
+            return
+        persistence.rewrite_journal_atomic(
+            self.config.journal_path, self.store.journal())
+
+    def _rearchive_orphaned_prefix(self, disk_rows: list[dict]) -> None:
+        """崩溃恢复：把内存流水中属于已淘汰明细、尚未被已提交归档覆盖的
+        连续前缀重新补归档。
+
+        判定：从最小 seq 开始，若 ``event_accepted`` 对应明细已不在本地
+        （已淘汰），则该位置属于待补归档前缀；遇到第一条明细仍在本地的
+        事件即停止（其后是正常 live 尾）。非事件行随前缀一起归档。
+        """
+        if self._archive is None:
+            return
+        committed = self._archive.committed_watermark()
+        with self._lock:
+            candidates = [
+                e for e in self.store.journal()
+                if e.seq > committed and e.kind != "history_evicted"]
+            watermark = committed
+            for entry in candidates:
+                if entry.kind == "event_accepted":
+                    eid = entry.payload.get("event_id")
+                    if eid in self.store._events:  # noqa: SLF001
+                        break  # 明细仍在本地：前缀到此为止
+                watermark = entry.seq
+            if watermark <= committed:
+                return
+            self._archive.submit(watermark, self.config.archive_max_pending)
+            self.store.mark_archive_pending(watermark)
+            self._pending_commits.add(watermark)
+
+    def _rehydrate_journal(self, rows: list[dict]) -> None:
+        """启动恢复时把快照之后的流水尾重建进内存（保留原始 seq/digest）。"""
+        from datetime import datetime
+
+        for row in sorted(rows, key=lambda r: r["seq"]):
+            ts = row.get("ts")
+            entry = JournalEntry(
+                seq=int(row["seq"]),
+                ts=datetime.fromisoformat(ts) if isinstance(ts, str) else ts,
+                kind=row["kind"],
+                payload=row.get("payload", {}),
+                digest=row.get("digest", ""),
+            )
+            self.store.append_journal(entry)
+
+    def _maybe_auto_snapshot(self) -> None:
+        if self.config.snapshot_every <= 0:
+            return
+        self._events_since_snapshot += 1
+        if self._events_since_snapshot >= self.config.snapshot_every:
+            self.save_snapshot()
+            self._snapshot_seq = self.store._seq  # noqa: SLF001
+            self._events_since_snapshot = 0
+
     def _write_journal(self, kind: str, payload: dict) -> JournalEntry:
         entry = JournalEntry(
             seq=self.store.next_seq(),
@@ -462,6 +815,8 @@ class Engine:
         )
         self.store.append_journal(entry)
         if self._persist:
+            # 日常仅顺序追加（flush+fsync）；已交归档但尚未 ack 的前缀仍
+            # 保留在磁盘上，崩溃恢复不丢。ack 回调中再原子重写完成裁剪。
             persistence.append_journal_file(self.config.journal_path, [entry])
         return entry
 
@@ -497,12 +852,20 @@ def build_engine(
     config: Config | None = None,
     *,
     autoload: bool = True,
-    persist: bool = False,
+    persist: bool = True,
 ) -> Engine:
-    """构造引擎；autoload 时从 rules_dir 加载初始规则（目录可不存在）。"""
+    """构造引擎；持久化开启时先做启动恢复（快照 + 流水尾）。
+
+    autoload 时从 rules_dir 加载初始规则（目录可不存在）；若本地状态中
+    已有规则版本（重启接续），不重复加载以免冲突。
+    """
     engine = Engine(config, persist=persist)
+    recovered = False
+    if persist:
+        recovered = engine.restore_on_startup()
     if autoload and engine.config.rules_dir.exists():
-        engine.load_rules_from_dir()
+        if not recovered and engine.store.current_revision() == 0:
+            engine.load_rules_from_dir()
     return engine
 
 
@@ -540,23 +903,45 @@ def _event_from_journal(payload: dict) -> Event:
 def replay(
     journal_path: Path | str,
     config: Config | None = None,
+    *,
+    include_archive: bool = False,
+    archive_dir: Path | str | None = None,
 ) -> tuple[Engine, list[dict]]:
     """基于流水重建引擎并逐条核对重放结论。
 
-    流水自包含：``rules_published`` 带规则文档摘要，``event_accepted``
-    带完整归一事件。重放按 seq 顺序重新执行规则判定与告警编排，
-    并把每个事件的结论（无命中/去重/开告警/抑制、命中的规则版本）
-    与原始流水逐条比对；任何不一致抛 :class:`ReplayConsistencyError`。
+    流水自包含：``rules_published`` 带完整内嵌规则（旧流水仅有文档摘要时
+    回退到 ``config.rules_dir`` 按 document_digest 匹配，匹配不到显式报错），
+    ``event_accepted`` 带完整归一事件。重放按 seq 顺序重新执行规则判定与
+    告警编排，并把每个事件的结论（无命中/去重/开告警/抑制、命中的规则
+    版本）与原始流水逐条比对；任何不一致抛 :class:`ReplayConsistencyError`。
 
-    ``rules_published`` 的规则文档原文从 ``config.rules_dir`` 提供
-    （按 document_digest 匹配）；缺失时该版本无法复现，显式报错。
+    ``include_archive=True`` 时先按 manifest 顺序读入归档分段（已被淘汰
+    的历史前缀），与当前 journal 拼成完整流水再核对——用于用归档重建
+    状态。归档缺失/损坏显式抛 :class:`ArchiveError`，不给出半成品结论。
 
     返回 ``(重建后的引擎, 逐条重放报告)``。
     """
+    from .archive import ArchiveWriter
     from .errors import ReplayConsistencyError, RuleValidationError
 
     cfg = config or Config()
     rows = persistence.read_journal(Path(journal_path))
+    if include_archive:
+        arc_dir = Path(archive_dir) if archive_dir is not None else (
+            cfg.archive_dir or (cfg.data_dir / "archive"))
+        archived = ArchiveWriter(arc_dir, fetch_entries=lambda a, b: []).read_archived_rows() \
+            if arc_dir.exists() else []
+        rows = archived + rows
+        # 全量重放：去重排序，且不允许 seq 重复（归档与本地不应重叠）
+        seen_seqs: set[int] = set()
+        deduped: list[dict] = []
+        for row in sorted(rows, key=lambda r: r["seq"]):
+            if row["seq"] in seen_seqs:
+                raise ReplayConsistencyError(
+                    f"seq {row['seq']} appears both in archive and live journal")
+            seen_seqs.add(row["seq"])
+            deduped.append(row)
+        rows = deduped
     engine = Engine(cfg, persist=False)
 
     # 规则来源摘要 -> 规则原文集合（支持单文档与目录聚合两种发布方式）
@@ -579,14 +964,20 @@ def replay(
         except Exception:  # noqa: BLE001 - 目录聚合不可用时仍可用单文档匹配
             pass
 
-    # event_id -> 原始结论流水（用于核对）
+    # event_id -> 紧随其 event_accepted 之后的原始结论行（全量索引，
+    # 对归档+本地混合流同样有效）
+    outcome_by_event: dict[str, dict] = {}
+    for r in rows:
+        if r["kind"] in _OUTCOME_KINDS:
+            p = r.get("payload", {})
+            eid = p.get("event_id")
+            if eid is not None and eid not in outcome_by_event:
+                outcome_by_event[eid] = r
+
     def _next_outcome(seq_after: int, event_id: str) -> dict | None:
-        for row in rows:
-            if row["seq"] <= seq_after:
-                continue
-            p = row.get("payload", {})
-            if p.get("event_id") == event_id and row["kind"] in _OUTCOME_KINDS:
-                return row
+        row = outcome_by_event.get(event_id)
+        if row is not None and row["seq"] > seq_after:
+            return row
         return None
 
     report: list[dict] = []
@@ -595,14 +986,28 @@ def replay(
         item: dict[str, Any] = {"seq": seq, "kind": kind, "consistent": True}
 
         if kind == "rules_published":
-            digest = payload.get("document_digest")
-            bundle = digest_to_bundle.get(digest) if digest else None
-            if bundle is None:
-                raise ReplayConsistencyError(
-                    f"seq={seq}: rule bundle digest {digest!r} not found in "
-                    f"{rules_dir}; cannot reproduce revision {payload.get('revision')}"
-                )
             rev = int(payload["revision"])
+            if payload.get("rules"):
+                # 新流水自包含：直接从内嵌规则还原该 revision
+                bundle = [
+                    rules_mod.rule_from_dict(r, revision=rev)
+                    for r in payload["rules"]]
+            else:
+                # 旧流水：规则原文从 rules_dir 按 document_digest 匹配
+                digest = payload.get("document_digest")
+                bundle = digest_to_bundle.get(digest) if digest else None
+                if bundle is None:
+                    if include_archive:
+                        raise ReplayConsistencyError(
+                            f"seq={seq}: rule bundle digest {digest!r} not "
+                            f"found inline or in {rules_dir}; cannot "
+                            f"reproduce revision {rev}"
+                        )
+                    # 未纳入归档：该 revision 原文已不在本地保留，登记为
+                    # 不可复现，不据此判不一致（完整核对请显式纳入归档）
+                    item["reproducible"] = False
+                    report.append(item)
+                    continue
             engine.store.publish_rules(rev, [_restamp(r, rev) for r in bundle])
             item["revision"] = rev
             report.append(item)
@@ -617,6 +1022,20 @@ def replay(
                     f"{event.digest!r} != journal {payload.get('digest')!r}"
                 )
             outcome_row = _next_outcome(seq, event.event_id)
+            # live-only 重放：规则原文或原始结论行已随淘汰进入归档时，
+            # 本地上下文不完整，跳过重建与核对（避免误判 no_match 污染），
+            # 登记为不可复现；完整逐条核对请显式 include_archive。
+            if not include_archive:
+                if outcome_row is None:
+                    item["reproducible"] = False
+                    report.append(item)
+                    continue
+                # 结论行在本地：若规则历史为空（规则发布行已入归档），同样
+                # 无法可靠重建，登记为不可复现（完整核对请 include_archive）
+                if not engine.store.rule_revisions():
+                    item["reproducible"] = False
+                    report.append(item)
+                    continue
             # 在已恢复的规则历史下重新判定（bypass 时间窗与幂等：重放历史数据）
             replayed = engine._replay_event(event)
             item["event_id"] = event.event_id
@@ -624,7 +1043,8 @@ def replay(
             item["replayed"] = replayed
             if outcome_row is None:
                 raise ReplayConsistencyError(
-                    f"seq={seq}: no original outcome for event {event.event_id}"
+                    f"seq={seq}: no original outcome for event "
+                    f"{event.event_id}"
                 )
             orig_kind = outcome_row["kind"]
             item["original_kind"] = orig_kind
@@ -659,12 +1079,24 @@ def replay(
         # 状态类/去重类流水已在事件重放中间接重建，这里仅登记
         report.append(item)
 
-    # 重放后引擎状态与流水结尾应自洽：流水条目数核对
-    expected_events = sum(1 for r in rows if r["kind"] == "event_accepted")
-    if engine.store.event_count() != expected_events:
+    # 重放后引擎状态与流水结尾应自洽：事件数核对。
+    # 全量重放（含归档）必须覆盖全部事件；live-only 只核对本地可复现部分。
+    total_events = sum(1 for r in rows if r["kind"] == "event_accepted")
+    reproducible_events = 0
+    for i in report:
+        if i.get("kind") == "event_accepted" and "reproducible" not in i:
+            reproducible_events += 1
+
+    if include_archive:
+        if engine.store.event_count() != total_events:
+            raise ReplayConsistencyError(
+                f"event count after replay {engine.store.event_count()} != "
+                f"journal event_accepted {total_events}"
+            )
+    elif engine.store.event_count() != reproducible_events:
         raise ReplayConsistencyError(
-            f"event count after replay {engine.store.event_count()} != "
-            f"journal event_accepted {expected_events}"
+            f"reproducible event count {engine.store.event_count()} != "
+            f"{reproducible_events}"
         )
     return engine, report
 

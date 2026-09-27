@@ -414,3 +414,47 @@ def match_any(rules: list[Rule], event: Event) -> tuple[Rule | None, MatchTrace]
             return rule, trace
         last_trace = trace
     return None, last_trace
+
+
+# ---------------------------------------------------------------------- #
+# 规则的自包含序列化（用于流水/归档，使重放不依赖 rules 目录原文）
+# ---------------------------------------------------------------------- #
+
+def rule_to_dict(rule: Rule) -> dict:
+    return {
+        "rule_id": rule.rule_id,
+        "version": rule.version,
+        "revision": rule.revision,
+        "name": rule.name,
+        "event_type": rule.event_type,
+        "conditions": rule.conditions,
+        "severity": rule.severity.value,
+        "dedup_window_s": rule.dedup_window_s,
+        "suppress_window_s": rule.suppress_window_s,
+        "suppress_max_severity": (
+            rule.suppress_max_severity.value
+            if rule.suppress_max_severity else None),
+        "correlation_key": rule.correlation_key,
+        "merge_key": rule.merge_key,
+        "enabled": rule.enabled,
+    }
+
+
+def rule_from_dict(raw: dict, *, revision: int | None = None) -> Rule:
+    return Rule(
+        rule_id=raw["rule_id"],
+        version=int(raw["version"]),
+        revision=int(raw["revision"] if revision is None else revision),
+        name=raw["name"],
+        event_type=raw["event_type"],
+        conditions=raw["conditions"],
+        severity=Severity(raw["severity"]),
+        dedup_window_s=raw["dedup_window_s"],
+        suppress_window_s=raw.get("suppress_window_s", 0),
+        suppress_max_severity=(
+            Severity(raw["suppress_max_severity"])
+            if raw.get("suppress_max_severity") else None),
+        correlation_key=raw.get("correlation_key", []),
+        merge_key=raw.get("merge_key", []),
+        enabled=raw.get("enabled", True),
+    )

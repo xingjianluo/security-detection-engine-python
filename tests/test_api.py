@@ -83,3 +83,42 @@ def test_full_flow_via_http(client):
     snapshot = client.post("/api/v1/snapshot")
     assert snapshot.status_code == 200
     log.info("HTTP 全流程通过，告警 %s 条，流水 %s 条", len(alerts), len(journal))
+
+
+def test_retention_and_archive_endpoints(tmp_path):
+    """HTTP：evict 结果与水位可见；reject_new 返回明确 503 原因码；
+    include_archive 重放入口可用。"""
+    from detector.engine import build_engine
+
+    d = tmp_path / "data"
+    cfg = Config(
+        rules_dir=tmp_path / "rules", data_dir=d,
+        journal_path=d / "journal.jsonl", snapshot_path=d / "snapshot.json",
+        archive_dir=d / "archive", future_tolerance_s=3600,
+        retention_max_records=12, retention_max_bytes=10**9,
+        retention_policy="reject_new", snapshot_every=0)
+    client = TestClient(create_app(cfg, persist=True))
+    doc = {"format_version": 2, "revision": 1, "rules": [
+        {"id": "brute", "event_type": "login", "severity": "high",
+         "conditions": {"all": [
+             {"field": "src_ip", "op": "prefix", "value": "10."}]}}]}
+    assert client.post("/api/v1/rules", json={"document": doc}).status_code == 200
+    now = utcnow().isoformat()
+    for i in range(4):
+        body = client.post("/api/v1/events", json={"events": [
+            {"event_id": f"h{i}", "type": "login", "severity": "high",
+             "timestamp": now, "src_ip": f"10.0.{i}.1", "user": "b"}]}).json()
+        assert "retention" in body and body["evicted"] == 0
+    resp = client.post("/api/v1/events", json={"events": [
+        {"event_id": "overflow", "type": "login", "severity": "high",
+         "timestamp": now, "src_ip": "10.9.9.9", "user": "b"}]})
+    assert resp.status_code == 503
+    assert resp.json()["error"]["code"] == "retention_full"
+
+    stats = client.get("/health").json()["stats"]
+    assert stats["retention"]["policy"] == "reject_new"
+    assert stats["archive"]["enabled"] is True
+
+    rep = client.post("/api/v1/replay?include_archive=false")
+    assert rep.status_code == 200
+    assert rep.json()["included_archive"] is False

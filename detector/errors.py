@@ -114,6 +114,30 @@ class SnapshotError(DetectionError):
     reason = "snapshot_error"
 
 
+class RetentionFullError(DetectionError):
+    """本地保留明细已达上限且策略为 reject_new；整批事务性拒绝。"""
+
+    reason = "retention_full"
+
+
+class ArchiveError(DetectionError):
+    """归档写入/读取失败。失败显式报错，不留半成品、不破坏当前状态。"""
+
+    reason = "archive_error"
+
+
+class ArchiveBackpressureError(DetectionError):
+    """待归档分段积压已达上限（归档 IO 跟不上摄入）。"""
+
+    reason = "archive_backpressure"
+
+
+class ArchiveDisabledError(ArchiveError):
+    """需要归档但归档功能未启用/不可用。"""
+
+    reason = "archive_disabled"
+
+
 class ReplayConsistencyError(DetectionError):
     """重放结果与原始流水不一致。"""
 

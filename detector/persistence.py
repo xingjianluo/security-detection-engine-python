@@ -82,6 +82,36 @@ def load_snapshot(path: Path) -> dict | None:
         return json.load(fh)
 
 
+def rewrite_journal_atomic(path: Path, entries: list) -> None:
+    """用给定条目集原子替换流水文件（归档提交后的裁剪用）。
+
+    临时文件 + fsync + os.replace：失败时原文件保持可用。
+    """
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(
+        prefix=path.name + ".", suffix=".tmp", dir=str(path.parent))
+    tmp = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            for entry in entries:
+                if isinstance(entry, dict):
+                    fh.write(json.dumps(entry, ensure_ascii=False,
+                                        default=str) + "\n")
+                else:
+                    fh.write(json.dumps(entry_to_dict(entry), ensure_ascii=False,
+                                        default=str) + "\n")
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
+
+
 def read_journal(path: Path) -> list[dict]:
     """读取流水；跳过空行，损坏行抛 SnapshotError 以便显式处理。"""
     from .errors import SnapshotError
