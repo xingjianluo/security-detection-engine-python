@@ -67,6 +67,7 @@ def create_app(config: Config | None = None, *, engine: Engine | None = None) ->
         return {
             "accepted": [a.__dict__ for a in result.accepted],
             "rejected": [r.__dict__ for r in result.rejected],
+            "evicted": result.evicted,
         }
 
     @app.get("/api/v1/events/{event_id}")
@@ -155,8 +156,10 @@ def create_app(config: Config | None = None, *, engine: Engine | None = None) ->
         ]}
 
     @app.post("/api/v1/replay")
-    def replay_journal():
-        _engine, report = replay(engine_ref.config.journal_path, engine_ref.config)
+    def replay_journal(include_archive: bool = Query(default=False)):
+        _engine, report = replay(engine_ref.config.journal_path,
+                                 engine_ref.config,
+                                 include_archive=include_archive)
         return {"report": report, "stats": _engine.stats()}
 
     return app

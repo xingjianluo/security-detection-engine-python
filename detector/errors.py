@@ -60,6 +60,18 @@ class BackpressureError(DetectionError):
     reason = "backpressure_rejected"
 
 
+class RetentionLimitError(DetectionError):
+    """保留上限触顶且策略为拒绝：新进入的历史被拒绝。"""
+
+    reason = "retention_limit_rejected"
+
+
+class ArchiveError(DetectionError):
+    """归档写入/读取失败；显式报错，不留半成品、不破坏可用状态。"""
+
+    reason = "archive_error"
+
+
 class DuplicateEventError(DetectionError):
     """幂等冲突：该事件标识已生效（用于显式区分重复投递）。"""
 

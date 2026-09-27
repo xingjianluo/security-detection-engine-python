@@ -11,7 +11,16 @@ import threading
 from copy import deepcopy
 from datetime import datetime, timezone
 
-from .models import Alert, AlertState, Event, JournalEntry, Rule, Severity
+from .models import (
+    Alert,
+    AlertState,
+    Event,
+    JournalEntry,
+    Rule,
+    Severity,
+    rule_from_dict,
+    rule_to_dict,
+)
 
 
 def _dt(raw) -> datetime:
@@ -24,6 +33,9 @@ class Store:
     def __init__(self) -> None:
         self._lock = threading.RLock()
         self._events: dict[str, Event] = {}
+        # 已淘汰事件的幂等锚点（event_id -> digest）：
+        # 明细可被保留策略淘汰，但重复投递判定必须保持，锚点不随明细淘汰。
+        self._event_tombstones: dict[str, str] = {}
         self._alerts: dict[str, Alert] = {}
         # revision -> list[Rule]（规则集历史，只增不改）
         self._rule_history: dict[int, list[Rule]] = {}
@@ -33,13 +45,14 @@ class Store:
 
     # ---- 幂等事件摄入 ----
     def seen_event(self, event_id: str) -> bool:
+        """事件是否已处理过（含已淘汰但保留锚点的历史事件）。"""
         with self._lock:
-            return event_id in self._events
+            return event_id in self._events or event_id in self._event_tombstones
 
     def put_event_if_absent(self, event: Event) -> bool:
-        """原子写入；已存在返回 False。重复并发投递只有一个胜出。"""
+        """原子写入；已存在（含锚点）返回 False。重复并发投递只有一个胜出。"""
         with self._lock:
-            if event.event_id in self._events:
+            if event.event_id in self._events or event.event_id in self._event_tombstones:
                 return False
             self._events[event.event_id] = event
             return True
@@ -52,6 +65,65 @@ class Store:
         with self._lock:
             event = self._events.get(event_id)
             return deepcopy(event) if event else None
+
+    # ---- 保留策略：淘汰原语 ----
+    def peek_oldest_events(self, count: int) -> list[Event]:
+        """查看最早摄入的 count 条事件（不变更状态）。"""
+        with self._lock:
+            return [deepcopy(self._events[k])
+                    for k in list(self._events)[: max(0, count)]]
+
+    def peek_terminal_alerts(self, count: int) -> list[Alert]:
+        """查看最旧的 count 条终态告警（不变更状态）。"""
+        with self._lock:
+            terminal = [a for a in self._alerts.values() if a.state.is_terminal]
+            terminal.sort(key=lambda a: (a.updated_at, a.alert_id))
+            return [deepcopy(a) for a in terminal[: max(0, count)]]
+
+    def evict_oldest_events(self, count: int) -> list[Event]:
+        """淘汰最早摄入的 count 条事件明细，并为其留下幂等锚点。
+
+        只影响历史明细：锚点保留后，重复投递仍判为已处理。
+        """
+        with self._lock:
+            evicted: list[Event] = []
+            for event_id in list(self._events)[: max(0, count)]:
+                event = self._events.pop(event_id)
+                self._event_tombstones[event_id] = event.digest
+                evicted.append(deepcopy(event))
+            return evicted
+
+    def evict_terminal_alerts(self, count: int) -> list[Alert]:
+        """淘汰最旧的终态（RESOLVED/MERGED）告警；活动告警绝不淘汰。"""
+        with self._lock:
+            terminal = [a for a in self._alerts.values() if a.state.is_terminal]
+            terminal.sort(key=lambda a: (a.updated_at, a.alert_id))
+            evicted: list[Alert] = []
+            for alert in terminal[: max(0, count)]:
+                self._alerts.pop(alert.alert_id, None)
+                evicted.append(deepcopy(alert))
+            return evicted
+
+    def trim_journal(self, count: int) -> list[JournalEntry]:
+        """移除最旧的 count 条流水并返回（调用方负责先归档）。"""
+        with self._lock:
+            count = min(max(0, count), len(self._journal))
+            evicted = self._journal[:count]
+            del self._journal[:count]
+            return list(evicted)
+
+    def alert_count(self) -> int:
+        with self._lock:
+            return len(self._alerts)
+
+    def tombstone_count(self) -> int:
+        with self._lock:
+            return len(self._event_tombstones)
+
+    def advance_seq(self, seq: int) -> None:
+        """恢复时推进流水序号下限，保证重启后 seq 单调不回退。"""
+        with self._lock:
+            self._seq = max(self._seq, int(seq))
 
     # ---- 规则版本 ----
     def publish_rules(self, revision: int, rules: list[Rule]) -> None:
@@ -159,29 +231,10 @@ class Store:
         with self._lock:
             return {
                 "events": {k: v.to_dict() for k, v in self._events.items()},
+                "event_tombstones": dict(self._event_tombstones),
                 "alerts": {k: v.to_dict() for k, v in self._alerts.items()},
                 "rule_history": {
-                    rev: [
-                        {
-                            "rule_id": r.rule_id,
-                            "version": r.version,
-                            "revision": r.revision,
-                            "name": r.name,
-                            "event_type": r.event_type,
-                            "conditions": r.conditions,
-                            "severity": r.severity.value,
-                            "dedup_window_s": r.dedup_window_s,
-                            "suppress_window_s": r.suppress_window_s,
-                            "suppress_max_severity": (
-                                r.suppress_max_severity.value
-                                if r.suppress_max_severity else None
-                            ),
-                            "correlation_key": r.correlation_key,
-                            "merge_key": r.merge_key,
-                            "enabled": r.enabled,
-                        }
-                        for r in rules
-                    ]
+                    rev: [rule_to_dict(r) for r in rules]
                     for rev, rules in self._rule_history.items()
                 },
                 "revision": self._revision,
@@ -233,27 +286,11 @@ class Store:
             history: dict[int, list[Rule]] = {}
             for rev_s, raws in data.get("rule_history", {}).items():
                 history[int(rev_s)] = [
-                    Rule(
-                        rule_id=r["rule_id"],
-                        version=r["version"],
-                        revision=int(rev_s),
-                        name=r["name"],
-                        event_type=r["event_type"],
-                        conditions=r["conditions"],
-                        severity=Severity(r["severity"]),
-                        dedup_window_s=r["dedup_window_s"],
-                        suppress_window_s=r.get("suppress_window_s", 0),
-                        suppress_max_severity=(
-                            Severity(r["suppress_max_severity"])
-                            if r.get("suppress_max_severity") else None
-                        ),
-                        correlation_key=r.get("correlation_key", []),
-                        merge_key=r.get("merge_key", []),
-                        enabled=r.get("enabled", True),
-                    )
+                    rule_from_dict({**r, "revision": int(rev_s)})
                     for r in raws
                 ]
             self._events = events
+            self._event_tombstones = dict(data.get("event_tombstones", {}))
             self._alerts = alerts
             self._rule_history = history
             self._revision = int(data.get("revision", 0))

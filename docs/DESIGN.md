@@ -83,6 +83,8 @@
 | `unsupported_rule_version` / `unsupported_rule_field` / `unsupported_rule_semantics` | 规则版本/未知字段/未知操作符 |
 | `illegal_state_transition` | 告警状态机非法跳转 |
 | `replay_mismatch` | 重放结论与流水不一致 |
+| `retention_limit_rejected` | 保留上限触顶且策略为 `reject`，新进入的历史被拒绝 |
+| `archive_error` | 归档写入/读取失败（显式报错，不留半成品） |
 
 事务语义：批次级违规（超限、背压）在任何写入前判定，**整批不留状态**；
 单条事件违规只拒绝该条，同批其它事件正常提交。
@@ -196,7 +198,8 @@ OPEN ──ack──> ACKNOWLEDGED ──resolve──> RESOLVED（终态）
 
 每条状态变更都产生一条流水（单调 `seq`），关键载荷：
 
-- `rules_published`：revision、rule_ids、`document_digest`
+- `rules_published`：revision、rule_ids、**规则原文**（自包含，恢复/
+  重放不依赖 `rules_dir` 当前内容）、`document_digest`
 - `event_accepted`：event_id、`digest`、**完整归一事件**
 - `alert_opened` / `alert_suppressed` / `alert_dedup`：alert_id、
   `rule_id/rule_version/rule_revision`、`suppressed_by`、逐条 `checks`
@@ -208,7 +211,70 @@ OPEN ──ack──> ACKNOWLEDGED ──resolve──> RESOLVED（终态）
 `replay_mismatch`。`POST /api/v1/replay` 返回逐条报告。
 快照恢复使用 `engine.restore_snapshot()` / `replay_from_snapshot()`。
 
-## 8. 配置项（`detector/config.py`）
+## 8. 重启接续（persist 默认开启）
+
+`Config.persist=True`（默认）时，相同的启动方式
+（`uvicorn main:app` → `create_app()` → `build_engine()`）自动完成：
+
+1. **写入侧**：每条流水 append 到 `journal_path`（fsync）；每
+   `snapshot_every` 条流水自动原子落一次快照。
+2. **恢复侧**：启动时先恢复快照（事件/告警/规则历史/幂等锚点/seq），
+   再按序重放流水文件中 `seq > 快照seq` 的尾部条目，重建最新状态。
+
+恢复后无需任何额外开关或特殊调用：
+
+- 重启前已处理的事件/告警/当前生效规则版本可继续查询；
+- 重复投递已处理事件仍返回 `dedup_hit=true`，不重复计数、不重复开告警
+  （幂等锚点随快照持久化）；
+- 去重/抑制窗口锚点（活动告警及其窗口参数）随状态恢复，抑制结论延续；
+- 规则目录内容未变时自动加载幂等，**不产生多余 revision**；
+- 流水 `seq` 单调不回退，重启后续写不冲突；
+- 可随时 `POST /api/v1/replay` 对这段历史做重放核对，结论与当初一致。
+
+`persist=False`（显式构造 `Engine(cfg)` 的默认）保持纯内存行为，
+既有测试与嵌入式用法不受影响。
+
+## 9. 有界保留与归档
+
+### 9.1 保留上限与两种策略
+
+`max_retained_events` / `max_retained_alerts` / `max_retained_journal`
+（0=不限制）任一触顶时按 `on_retention_exceeded` 处置：
+
+- `reject`：新事件被拒绝，单条结论 `reason=retention_limit_rejected`
+  （与背压/校验拒绝可区分）；**重复投递已处理事件仍判 dedup**，
+  不算新进入。该策略下需运维介入（调大上限或改 evict）才能继续写入。
+- `evict`（默认）：淘汰最旧历史，摄入正常返回，响应体 `evicted`
+  数组列出本批淘汰明细（`reason=retention_evicted`），两种结果
+  从返回即可区分。
+
+### 9.2 淘汰只影响历史明细
+
+- 事件：淘汰最旧明细，但留下 **幂等锚点**（event_id→digest），
+  重复投递仍判已处理，不会把旧事件判成新事件；
+- 告警：**只淘汰终态**（resolved/merged）；活动告警、去重/抑制窗口
+  锚点绝不淘汰——抑制结论与计数不漂移（活动告警可暂时超出上限，
+  锚点正确性优先于上限）；
+- 流水：淘汰最旧条目。persist 模式下淘汰前先落快照，恢复不依赖
+  已淘汰的流水段，重启状态一致。
+
+### 9.3 归档（`archive_enabled` 默认开启）
+
+被淘汰的事件/告警/流水追加写入 `archive_dir/archive.jsonl`
+（每条记录带 `archived_at` 与 `record_kind`，边界清楚）：
+
+- **先写归档、后改状态**：归档写失败抛 `archive_error`，热状态
+  原封不动、不留半成品；归档读损坏同样显式报错；
+- 归档写盘在引擎锁外进行，不阻塞正常摄入判定；
+- 日常查询（事件/告警/流水/重放）**不加载归档**；
+- 完整重放或用归档重建状态时显式纳入：
+  `replay(journal_path, cfg, include_archive=True)` 或
+  `POST /api/v1/replay?include_archive=true`——按 `seq` 归并去重后
+  逐条核对，结论与无淘汰时一致，每条判定仍可追溯到命中规则版本
+  与输入摘要。流水被截断后不带归档直接重放会显式失败
+  （`replay_mismatch`），不会给出静默的错误结论。
+
+## 10. 配置项（`detector/config.py`）
 
 | 配置 | 默认 | 含义 |
 |---|---|---|
@@ -222,15 +288,23 @@ OPEN ──ack──> ACKNOWLEDGED ──resolve──> RESOLVED（终态）
 | `default_dedup_window_s` | 300 | 规则未声明时的去重窗口 |
 | `supported_rule_versions` | (1,2) | 接受的规则格式版本 |
 | `rules_dir` | `rules` | 启动自动加载与重放取规则原文的目录 |
-| `journal_path` / `snapshot_path` | `data/…` | 流水/快照位置 |
+| `persist` | `True` | 启动自动从 快照+流水 恢复（重启接续） |
+| `journal_path` / `snapshot_path` | `data/…` | 流水/快照位置（`data_dir` 覆盖时自动锚定其下） |
+| `snapshot_every` | 1000 | 每 N 条流水自动落快照（0 关闭） |
+| `max_retained_events` | 0 | 事件明细保留上限（条，0=不限） |
+| `max_retained_alerts` | 0 | 告警明细保留上限（条，0=不限；活动告警不淘汰） |
+| `max_retained_journal` | 0 | 判定流水保留上限（条，0=不限） |
+| `on_retention_exceeded` | `evict` | `evict`（淘汰最旧）/ `reject`（拒绝新进入） |
+| `archive_enabled` | `True` | 淘汰的历史是否落归档 |
+| `archive_dir` | `data/archive` | 归档目录（日常查询不加载） |
 
-## 9. HTTP 接口
+## 11. HTTP 接口
 
 | 方法/路径 | 说明 |
 |---|---|
 | `GET /` | 既有接口，保持 `{"Hello":"World"}` |
 | `GET /health` | 存活与统计 |
-| `POST /api/v1/events` | 批次摄入，body `{source, events:[…]}` |
+| `POST /api/v1/events` | 批次摄入，body `{source, events:[…]}`；响应含 `accepted/rejected/evicted` |
 | `GET /api/v1/events/{id}` | 事件查询 |
 | `POST /api/v1/rules` | 发布规则文档 `{document:{…}}`，返回新 revision |
 | `GET /api/v1/rules` | 当前生效规则集与 revision |
@@ -240,17 +314,17 @@ OPEN ──ack──> ACKNOWLEDGED ──resolve──> RESOLVED（终态）
 | `POST /api/v1/alerts/tick-suppress-expiry` | 抑制到期恢复 |
 | `GET /api/v1/journal` | 流水 |
 | `POST /api/v1/snapshot` | 原子写快照 |
-| `POST /api/v1/replay` | 流水重放并返回逐条核对报告 |
+| `POST /api/v1/replay` | 流水重放并返回逐条核对报告；`?include_archive=true` 显式纳入归档 |
 
 错误响应统一为 `{"error":{"code":…,"message":…}}`
 （422 校验类 / 503 背压 / 404 未找到）。
 
-## 10. 启动与验证
+## 12. 启动与验证
 
 ```bash
 uv sync --group dev
-uv run uvicorn main:app --port 8000        # 启动方式与既有服务一致
-uv run pytest -q                            # 24 个单测（含摘要/依据日志）
+uv run uvicorn main:app --port 8000        # 启动方式与既有服务一致（默认持久化+恢复）
+uv run pytest -q                            # 40 个单测（含摘要/依据日志）
 ```
 
 快速手工验证：
@@ -264,7 +338,27 @@ curl -s -XPOST localhost:8000/api/v1/events -H 'content-type: application/json' 
 curl -s localhost:8000/api/v1/alerts | python -m json.tool
 ```
 
+重启接续手工验证（相同启动方式跑两次，无需额外开关）：
+
+```bash
+uv run uvicorn main:app --port 8000 &        # 第一次运行，摄入若干事件后杀掉
+uv run uvicorn main:app --port 8000 &        # 第二次运行：
+curl -s localhost:8000/api/v1/events/e1      # 重启前事件仍可查
+curl -s -XPOST localhost:8000/api/v1/events -H 'content-type: application/json' -d '{
+  "source":"generic_json","events":[{"event_id":"e1","type":"ssh_auth_failure",
+  "severity":"high","timestamp":"2026-09-22T11:00:00Z","src_ip":"10.1.1.1","user":"bob"}]}'
+# -> dedup_hit=true，不重复计数
+curl -s -XPOST localhost:8000/api/v1/replay  # 对这段历史重放核对，结论一致
+```
+
+保留与归档验证（配置 `max_retained_events` 等上限后持续投递）：
+`GET /health` 的 `stats` 可见 `event_tombstones` 与 `retention` 策略；
+摄入响应 `evicted` 列出淘汰明细；`data/archive/archive.jsonl` 存归档；
+`POST /api/v1/replay?include_archive=true` 做含归档的完整重放。
+
 测试覆盖（`tests/`）：畸形事件归类、时间非法/迟到/未来、批次上限、
 v1/v2 兼容与显式拒绝、历史版本绑定、窗口边界（299/300s）、抑制优先级、
 合并归属、乱序计数、64 线程同 id 并发只生效一次、3200 并发事件无计数
-漂移、背压无部分写入、流水重放一致与篡改检测、HTTP 全流程。
+漂移、背压无部分写入、流水重放一致与篡改检测、HTTP 全流程、
+**重启接续（状态/去重/抑制锚点/重放一致）**、**保留上限下 reject 与
+evict 两条路径**、**淘汰后锚点不漂移与归档重放一致**、归档损坏显式报错。

@@ -170,6 +170,8 @@ class BatchResult:
     rejected: list[EventResult] = field(default_factory=list)
     batch_rejected: bool = False
     batch_reason: str | None = None
+    # 本批触发的保留淘汰明细（evict 策略；reject 策略通过 rejected 原因码区分）
+    evicted: list[dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -193,6 +195,49 @@ class Rule:
     correlation_key: list[str] = field(default_factory=list)
     merge_key: list[str] = field(default_factory=list)  # 同 key 告警合并
     enabled: bool = True
+
+
+def rule_to_dict(rule: "Rule") -> dict[str, Any]:
+    """规则的可持久化字典表示（快照/流水/归档共用，保证可复原）。"""
+    return {
+        "rule_id": rule.rule_id,
+        "version": rule.version,
+        "revision": rule.revision,
+        "name": rule.name,
+        "event_type": rule.event_type,
+        "conditions": rule.conditions,
+        "severity": rule.severity.value,
+        "dedup_window_s": rule.dedup_window_s,
+        "suppress_window_s": rule.suppress_window_s,
+        "suppress_max_severity": (
+            rule.suppress_max_severity.value if rule.suppress_max_severity else None
+        ),
+        "correlation_key": list(rule.correlation_key),
+        "merge_key": list(rule.merge_key),
+        "enabled": rule.enabled,
+    }
+
+
+def rule_from_dict(raw: dict[str, Any]) -> "Rule":
+    """从 :func:`rule_to_dict` 的字典还原规则（revision 以字典内为准）。"""
+    return Rule(
+        rule_id=raw["rule_id"],
+        version=int(raw["version"]),
+        revision=int(raw.get("revision", 0)),
+        name=raw["name"],
+        event_type=raw["event_type"],
+        conditions=raw["conditions"],
+        severity=Severity(raw["severity"]),
+        dedup_window_s=raw.get("dedup_window_s", 300),
+        suppress_window_s=raw.get("suppress_window_s", 0),
+        suppress_max_severity=(
+            Severity(raw["suppress_max_severity"])
+            if raw.get("suppress_max_severity") else None
+        ),
+        correlation_key=list(raw.get("correlation_key", [])),
+        merge_key=list(raw.get("merge_key", [])),
+        enabled=raw.get("enabled", True),
+    )
 
 
 @dataclass
