@@ -39,7 +39,7 @@ from .errors import (
     UnsupportedRuleSemanticsError,
     UnsupportedRuleVersionError,
 )
-from .models import Event, MatchTrace, Rule, Severity
+from .models import Event, MatchTrace, Rule, Severity, input_digest
 
 # 各版本规则允许的顶层字段（白名单：多余字段即拒绝）
 _V1_FIELDS = frozenset({"id", "name", "event_type", "min_severity",
@@ -291,6 +291,9 @@ def load_rules_dir(path: Path) -> tuple[list[Rule], int]:
     """
     files = sorted(Path(path).glob("*.json"))
     if not files:
+        if Path(path).exists() and not Path(path).is_dir():
+            raise RuleValidationError(
+                f"rules path {path} exists but is not a directory")
         raise RuleValidationError(f"no *.json rule files under {path}")
     all_rules: list[Rule] = []
     revision = 0
@@ -311,6 +314,22 @@ def load_rules_dir(path: Path) -> tuple[list[Rule], int]:
         for r in all_rules
     ]
     return stamped, revision
+
+
+def rule_bundle_digest(rules: list[Rule]) -> str:
+    """规则集内容摘要：只取决于规则语义内容，与发布 revision 编号、
+    规则文件在目录中的排列顺序无关。
+
+    用于启动时比较磁盘规则与当前生效规则是否真的变化：内容不变则复用
+    同一 revision（不多发版本），内容变化则发布新 revision。
+    """
+    canonical = sorted(
+        json.dumps(
+            {k: v for k, v in rule_to_dict(r).items() if k != "revision"},
+            sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+            default=str)
+        for r in rules)
+    return input_digest(canonical)
 
 
 # ---- 评估 ---------------------------------------------------------------

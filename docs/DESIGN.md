@@ -231,7 +231,8 @@ OPEN ──ack──> ACKNOWLEDGED ──resolve──> RESOLVED（终态）
 2. 重放 `journal.jsonl` 中快照之后的流水尾（事件、ack/resolve/merge/
    reopen 生命周期变更、规则发布），随后立即固化一次快照；
 3. 规则发布行若已随淘汰进入归档前缀，则从归档 manifest 只读补载规则，
-   **不**日常加载归档事件（其状态已在快照中）。
+   **不**日常加载归档事件（其状态已在快照中）；
+4. **按相同启动方式从 `rules_dir` 同步磁盘规则**（见 7.1.1）。
 
 因此重启后：
 
@@ -242,6 +243,33 @@ OPEN ──ack──> ACKNOWLEDGED ──resolve──> RESOLVED（终态）
 - 可随时针对这段历史发起重放核对，结论与当初一致。
 
 直接 `Engine(Config())`（`persist=False`）的内部/测试构造行为保持不变。
+
+### 7.1.1 重启时的规则加载与版本语义
+
+启动恢复完成后，引擎总是读取 `rules_dir` 下全部 `*.json`（目录不存在则
+跳过），以**规则内容摘要**（`rules.rule_bundle_digest`：对每条规则去掉
+发布编号 revision 后按 rule_id 规范化排序计算）与当前生效版本比较：
+
+| 磁盘规则情况 | 启动行为 | 当前生效 revision |
+|---|---|---|
+| 内容与当前生效版本**相同**（仅改文件里声明的 `revision` 编号也算相同） | 复用当前 revision，**不多发版本**、不写流水 | 保持不变 |
+| 内容**发生变化**（增删规则、改条件/严重度/窗口/键等） | 自动发布新版本（`max(当前+1, 文件声明 revision)`）并写流水，**立即参与后续判定** | 单调 +1（或采用更大的声明值） |
+| 首次启动、本地无历史状态 | 加载并发布（采用文件声明的正 revision，否则为 1） | 文件声明或 1 |
+| 规则非法 / JSON 写坏 / 只写了一半（多文件中任一非法） | **启动阶段显式抛 `RuleValidationError`（`rule_validation_failed` 等），进程启动失败** | 不变 |
+
+失败边界保证：
+
+- 同步时**先完整解析、校验目录中全部文件**，任一文件非法（坏 JSON、
+  未知字段/操作符/版本、空规则集、跨文件重复 id、`rules_dir` 存在但不是
+  目录等）即在触碰任何引擎状态前失败——**不会出现只加载一半的半套规则**；
+- 失败时不写规则历史、不写流水、不改写快照，**原有可用状态原封不动**；
+  修好磁盘文件后以相同方式重启即恢复，也**不会静默沿用旧规则继续跑**；
+- 历史告警绑定它**命中时刻**的 `(rule_version, rule_revision)`：规则
+  历史 append-only，重启发布新版本不改写任何历史告警；旧 revision 仍可
+  经 `store.rules_at(rev)` 取出，跨版本历史仍可逐条重放核对。
+
+运行期经 `POST /api/v1/rules` 显式发布的版本与重启同步的版本同处一条
+append-only 版本历史，语义一致（revision 必须单调推进）。
 
 ## 7.2 有界保留（拒绝 / 淘汰两条路径，结果可区分）
 
@@ -295,15 +323,24 @@ OPEN ──ack──> ACKNOWLEDGED ──resolve──> RESOLVED（终态）
 | `future_tolerance_s` | 300 | 允许的未来时钟漂移 |
 | `default_dedup_window_s` | 300 | 规则未声明时的去重窗口 |
 | `supported_rule_versions` | (1,2) | 接受的规则格式版本 |
-| `rules_dir` | `rules` | 启动自动加载与旧流水重放取规则原文的目录 |
-| `journal_path` / `snapshot_path` | `data/…` | 流水/快照位置 |
+| `rules_dir` | `rules` | 启动自动同步与旧流水重放取规则原文的目录 |
+| `data_dir` | `data` | 本地数据目录（见下“持久化位置”） |
+| `journal_path` / `snapshot_path` | `data_dir/journal.jsonl`、`data_dir/snapshot.json` | 流水/快照位置；**默认跟随 `data_dir`**，仅显式单独指定时才用给定路径 |
 | `snapshot_every` | 1000 | 每接受 N 条事件自动固化快照（0 关闭周期快照） |
 | `retention_max_records` | 100000 | 本地历史明细条数上限（事件+终态告警+流水） |
 | `retention_max_bytes` | 64 MiB | 本地历史明细序列化字节上限 |
 | `retention_policy` | `evict_oldest` | `evict_oldest` / `reject_new` |
 | `archive_enabled` | `True` | 淘汰明细是否落长期归档 |
-| `archive_dir` | `data/archive` | 归档目录（分段 + manifest） |
+| `archive_dir` | `data_dir/archive` | 归档目录（分段 + manifest）；`None` 跟随 `data_dir`，显式给定时按给定路径 |
 | `archive_max_pending` | 8 | 待归档目标积压上限，满则 `archive_backpressure` |
+
+**持久化位置与 `data_dir` 的关系**：`journal_path`、`snapshot_path`
+未显式给定时（构造时传 `None`）自动解析为 `data_dir/journal.jsonl`、
+`data_dir/snapshot.json`，`archive_dir=None` 时解析为
+`data_dir/archive`。因此两个实例只要配置不同的 `data_dir`（无需再逐一
+指定三个路径），本地处理记录、状态快照与归档就各写各的目录，互不串
+数据，重启后各自回到同一份状态；显式单独指定任一位置时，该位置按
+指定值生效、不被 `data_dir` 覆盖。
 
 兼容范围：新增配置全部有默认值，既有 `Config()`/`Engine(...)`/
 `create_app(...)` 构造与既有接口、状态机、拒绝码行为保持不变；旧快照
@@ -368,6 +405,45 @@ eng._archive.wait_idle()                  # 测试中等待归档落盘
 _eng, report = replay(cfg.journal_path, cfg, include_archive=True)  # 完整核对
 ```
 
+本地验证重启时的规则版本语义与非法配置失败边界：
+
+```python
+import json
+from pathlib import Path
+from detector.config import Config
+from detector.engine import build_engine
+from detector.errors import RuleValidationError
+
+def cfg(base):                       # 只给 data_dir，持久化自动跟随
+    return Config(rules_dir=base / "rules", data_dir=base / "data",
+                  future_tolerance_s=3600, snapshot_every=0)
+
+rules = Path("rules/auth_detection.json")
+eng = build_engine(cfg(base), persist=True)            # 首次：revision 1
+build_engine(cfg(base), persist=True).store.current_revision()   # 内容不变 -> 仍为 1
+rules.write_text(...)        # 改条件/加规则（内容变化）
+eng = build_engine(cfg(base), persist=True)            # 相同启动方式 -> 自动发布 rev 2
+eng.store.rule_revisions()                             # [1, 2]，历史告警仍绑定 rev 1
+rules.write_text("{ broken")
+build_engine(cfg(base), persist=True)                  # -> RuleValidationError，启动失败
+                                                       #    旧快照/流水原封不动
+```
+
+本地验证不同 `data_dir` 的实例互不串持久化数据：
+
+```python
+cxa = Config(rules_dir=Path("rules"), data_dir=Path("/data/instance-a"))
+cxb = Config(rules_dir=Path("rules"), data_dir=Path("/data/instance-b"))
+# journal/snapshot/archive 默认分别落在各自 data_dir 下；
+# A 实例重启后查不到只投给 B 的事件，反之亦然。
+```
+
+也可直接运行针对性自动化测试：
+
+```bash
+uv run pytest tests/test_restart_rules.py -q
+```
+
 测试覆盖（`tests/`）：畸形事件归类、时间非法/迟到/未来、批次上限、
 v1/v2 兼容与显式拒绝、历史版本绑定、窗口边界（299/300s）、抑制优先级、
 合并归属、乱序计数、64 线程同 id 并发只生效一次、3200 并发事件无计数
@@ -376,6 +452,11 @@ v1/v2 兼容与显式拒绝、历史版本绑定、窗口边界（299/300s）、
 - `test_restart_continuity.py`：相同启动方式重建后事件/告警/规则版本/
   去重与抑制锚点接续、重启后重复投递仍判重、终态生命周期接续、重启后
   重放核对一致；
+- `test_restart_rules.py`：磁盘规则内容变化后按相同方式重启自动发布
+  新版本并立即参与判定（历史告警仍绑定旧版本、跨版本重放一致）、内容
+  不变（含只改声明 revision）时版本不变且不多发版本、规则非法/写坏/
+  只写一半/空目录时启动显式失败且旧快照与流水不被破坏、不同 `data_dir`
+  的实例本地持久化互不串数据、显式指定路径优先于 `data_dir`；
 - `test_retention.py`：`reject_new`（503/`retention_full`/零写入）与
   `evict_oldest`（`evicted>0`/水位回落/结果可区分）两条路径，淘汰后
   幂等锚点与活动去重/抑制锚点不漂移，关闭归档时内联裁剪；

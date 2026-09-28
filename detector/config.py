@@ -30,9 +30,12 @@ class Config:
     rules_dir: Path = Path("rules")
     data_dir: Path = Path("data")
 
-    # 持久化/重放
-    journal_path: Path = Path("data/journal.jsonl")
-    snapshot_path: Path = Path("data/snapshot.json")
+    # 持久化/重放。
+    # journal_path / snapshot_path 默认跟随 data_dir（data_dir/journal.jsonl、
+    # data_dir/snapshot.json），只有显式单独指定时才使用给定位置，保证配置了
+    # 不同 data_dir 的实例本地持久化互不串数据。
+    journal_path: Path | None = None
+    snapshot_path: Path | None = None
     snapshot_every: int = 1000          # 每处理 N 条事件自动落一次快照
 
     # 有界保留：本地历史明细（归一事件明细 + 已终态告警明细 + 流水明细）
@@ -50,3 +53,13 @@ class Config:
     # None 表示 data_dir/archive；显式给定时按给定路径
     archive_dir: Path | None = None
     archive_max_pending: int = 8        # 待归档目标积压上限；满则拒绝新摄入
+
+    def __post_init__(self) -> None:
+        # 默认位置跟随 data_dir；显式指定（journal_path/snapshot_path/
+        # archive_dir）保持原样不被覆盖。frozen dataclass 通过 __dict__ 赋值。
+        if self.journal_path is None:
+            object.__setattr__(self, "journal_path",
+                               Path(self.data_dir) / "journal.jsonl")
+        if self.snapshot_path is None:
+            object.__setattr__(self, "snapshot_path",
+                               Path(self.data_dir) / "snapshot.json")

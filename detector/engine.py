@@ -79,16 +79,18 @@ class Engine:
         """校验并发布一份规则文档，返回新 revision。"""
         rules, doc_rev = rules_mod.load_rule_document(raw)
         rev = revision if revision is not None else doc_rev
-        if rev <= 0:
-            rev = self.store.current_revision() + 1
         with self._lock:
-            # revision 必须单调推进
-            if rev <= self.store.current_revision():
+            max_ever = max(self.store.rule_revisions(), default=0)
+            if rev <= 0:
+                rev = max_ever + 1
+            # revision 必须严格大于历史上发布过的最大 revision（历史可能
+            # 因文件声明值有跳跃），保证 append-only 单调推进
+            if rev <= max_ever:
                 from .errors import RuleValidationError
 
                 raise RuleValidationError(
-                    f"rule revision {rev} is not greater than current "
-                    f"{self.store.current_revision()}"
+                    f"rule revision {rev} is not greater than max published "
+                    f"{max_ever}"
                 )
             self.store.publish_rules(rev, rules)
             self._write_journal(
@@ -97,6 +99,11 @@ class Engine:
                  "document_digest": input_digest(raw),
                  "rules": [rules_mod.rule_to_dict(r) for r in rules]},
             )
+            if self._persist:
+                # 规则发布后立即固化快照，避免“只发规则、随后无事件即崩溃”
+                # 时最新规则历史只在流水尾、被下一次快照/裁剪丢失。
+                self.save_snapshot()
+                self._snapshot_seq = self.store._seq  # noqa: SLF001
         log.info("rules published revision=%s rules=%s", rev, [r.rule_id for r in rules])
         return rev
 
@@ -105,14 +112,66 @@ class Engine:
         return self.publish_rules_document(raw)
 
     def load_rules_from_dir(self, path: Path | str | None = None) -> int:
+        """从目录强制发布一版规则（保留原有显式调用语义），返回发布 revision。"""
+        rev, _changed = self._sync_rules_dir(path, force=True)
+        return rev
+
+    def sync_rules_from_dir(
+        self, path: Path | str | None = None,
+    ) -> tuple[int, bool]:
+        """按相同启动方式同步磁盘规则目录与当前生效规则。
+
+        - 目录中**全部**文件先完整解析+校验（非法 JSON、未知字段/操作符、
+          空规则集、跨文件重复 id 等都会在此处显式抛出
+          :class:`RuleValidationError`），全部通过后才触碰引擎状态，因此
+          坏配置不会产生“只加载了一半”的规则，也不会破坏原有可用状态；
+        - 目录不存在时跳过（返回当前 revision, False），与原有行为一致；
+        - 以规则**内容摘要**比较（与文件声明的 revision 编号、文件排列
+          顺序无关）：内容与当前生效版本相同则复用同一 revision，不多发
+          版本；内容不同则发布新 revision（取 max(当前+1, 目录声明)），
+          立即参与后续判定。历史告警仍绑定其命中时的旧 revision，规则
+          历史 append-only，不被改写。
+
+        返回 ``(当前生效 revision, 本次是否发布了新版本)``。
+        """
+        return self._sync_rules_dir(path, force=False)
+
+    def _sync_rules_dir(self, path: Path | str | None, *, force: bool
+                        ) -> tuple[int, bool]:
         directory = Path(path) if path is not None else self.config.rules_dir
-        rules, rev = rules_mod.load_rules_dir(directory)
-        if rev <= 0:
-            rev = self.store.current_revision() + 1
+        if not directory.exists():
+            return self.store.current_revision(), False
+
+        # 1) 纯解析校验：任何坏文件在此显式失败，此前不写任何状态
+        loaded, doc_rev = rules_mod.load_rules_dir(directory)
+        incoming_digest = rules_mod.rule_bundle_digest(loaded)
+
         with self._lock:
-            if rev <= self.store.current_revision():
-                rev = self.store.current_revision() + 1
-            rules = [_restamp(r, rev) for r in rules]
+            current_rev = self.store.current_revision()
+            active = self.store.active_rules() if current_rev > 0 else []
+            same_content = (
+                current_rev > 0
+                and rules_mod.rule_bundle_digest(active) == incoming_digest
+            )
+            if not force and same_content:
+                # 内容不变：复用当前 revision，不多发版本
+                return current_rev, False
+
+            rev = doc_rev if (current_rev == 0 and doc_rev > 0) else 1
+            if self.store.rule_revisions():
+                # 已存在历史版本：revision 必须严格大于历史上发布过的最大
+                # revision（历史可能因文件声明值而有跳跃，如 1,2,99），
+                # 声明值更大时采用声明值。
+                rev = max(max(self.store.rule_revisions()) + 1, doc_rev)
+            if rev in self.store.rule_revisions() and rev != current_rev:
+                # 显式失败而不是覆盖/回退 append-only 历史
+                from .errors import RuleValidationError
+
+                raise RuleValidationError(
+                    f"rule revision {rev} already exists with different "
+                    f"content (current={current_rev}); revision history is "
+                    f"append-only and cannot be overwritten")
+            rules = [_restamp(r, rev) for r in loaded]
             self.store.publish_rules(rev, rules)
             # 组合文档（固定规则 id 顺序）作为重放可核对的原文摘要
             combined = {
@@ -126,9 +185,20 @@ class Engine:
                 {"revision": rev, "rule_ids": [r.rule_id for r in rules],
                  "source": str(directory),
                  "document_digest": input_digest(combined),
+                 "content_digest": incoming_digest,
                  "rules": [rules_mod.rule_to_dict(r) for r in rules]},
             )
-        return rev
+            if self._persist:
+                # 规则发布只写流水时，若其后没有事件触发快照，崩溃后最新
+                # 规则历史会丢（快照停在旧 revision）。启动同步发布后立即
+                # 固化快照，保证“重启即生效”的规则版本在下次崩溃/重启后
+                # 仍然在（快照 + 已 fsync 的流水双保险）。
+                self.save_snapshot()
+                self._snapshot_seq = self.store._seq  # noqa: SLF001
+        log.info("rules synced from %s revision=%s changed=%s rules=%s",
+                 directory, rev, not same_content,
+                 [r.rule_id for r in rules])
+        return rev, True
 
     # ------------------------------------------------------------------ #
     # 摄入
@@ -856,16 +926,21 @@ def build_engine(
 ) -> Engine:
     """构造引擎；持久化开启时先做启动恢复（快照 + 流水尾）。
 
-    autoload 时从 rules_dir 加载初始规则（目录可不存在）；若本地状态中
-    已有规则版本（重启接续），不重复加载以免冲突。
+    autoload 时（恢复之后）始终按相同启动方式从 rules_dir 同步规则
+    （目录可不存在，不存在则跳过）：
+
+    - 磁盘规则内容与当前生效版本相同 -> 复用同一 revision，不多发版本；
+    - 磁盘规则内容已变化 -> 自动发布新版本并立即参与后续判定，历史告警
+      仍绑定命中时的旧版本；
+    - 规则文件非法/写坏/只写了一半 -> 同步阶段显式抛出
+      RuleValidationError，启动失败且原有可用状态（快照/流水）不被改动，
+      不会静默沿用旧规则，也不会留下只加载一半的规则集。
     """
     engine = Engine(config, persist=persist)
-    recovered = False
     if persist:
-        recovered = engine.restore_on_startup()
-    if autoload and engine.config.rules_dir.exists():
-        if not recovered and engine.store.current_revision() == 0:
-            engine.load_rules_from_dir()
+        engine.restore_on_startup()
+    if autoload:
+        engine.sync_rules_from_dir()
     return engine
 
 
