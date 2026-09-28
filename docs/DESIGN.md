@@ -144,6 +144,38 @@ v2 文档内也允许内嵌 `version:1` 条目。
 - 重放时规则文档按发布时记录的 `document_digest` 从 `rules_dir` 找回，
   找不到即显式失败，杜绝用被改过的规则“复现”旧结论。
 
+### 4.4 重启时的规则加载与版本语义
+
+服务以相同启动方式（`uvicorn main:app`，即
+`create_app(persist=True)` / `build_engine(..., persist=True)`）启动时，
+每次启动都会处理 `rules_dir` 下的规则配置，版本号是否变化完全由
+**规则内容**决定（内容摘要 `content_digest` 按规则集合规范化计算，
+不含盖戳的 revision 号、与文件顺序无关）：
+
+1. **启动预检（失败边界在最前面）**：在构造引擎、恢复快照、读流水等
+   任何状态动作之前，先完整读取并校验目录下**全部** `*.json`。任一文件
+   坏 JSON、不支持的版本/字段/操作符、空规则集、跨文件重复 id，或文件
+   只写了一半，启动都在此**显式抛 `RuleValidationError` 失败**：
+   - 不会用“只加载了一半”的半套规则启动；
+   - 不会悄悄沿用磁盘上的旧规则继续跑（要么整套合法配置启动，要么不启动）；
+   - 预检是只读零副作用的，原有快照与流水文件原封不动；配置修好后按
+     同样方式重启，即恢复到此前的可用状态，坏配置期间不留下任何新版本。
+2. **状态恢复**：随后从本地快照 + 流水尾恢复（见 7.1）。
+3. **内容对齐**：把磁盘规则的内容摘要与当前生效版本比较：
+   - **内容不变**：保持当前 revision，**不**新发版本、不写流水
+     （即使文件里手写的 `revision` 号变了，也不多发版本）；
+   - **内容变化**（规则增/删/改，含 `enabled`、阈值、条件等任何变化）：
+     自动以 `current_revision + 1` 发布一个新版本并写入流水，立即参与
+     后续判定；规则历史只增不改，**历史告警仍绑定它命中时的那一版**，
+     不受后来改动影响；
+   - 全新状态（首次启动）：磁盘规则加载为 revision 1。
+4. `rules_dir` 不存在时跳过规则步骤（用于嵌入/测试后经
+   `POST /api/v1/rules` 手工发布）；运行期手工发布与启动期发布走同一套
+   单调 revision 与流水记录（流水行额外带 `content_digest`）。
+
+> 说明：自动版本号以引擎内单调计数为准（`current+1`），文件中声明的
+> `revision` 字段仅作文档元信息，不参与“内容是否变化”的判断。
+
 ## 5. 告警状态机与窗口
 
 ### 5.1 状态
@@ -231,7 +263,9 @@ OPEN ──ack──> ACKNOWLEDGED ──resolve──> RESOLVED（终态）
 2. 重放 `journal.jsonl` 中快照之后的流水尾（事件、ack/resolve/merge/
    reopen 生命周期变更、规则发布），随后立即固化一次快照；
 3. 规则发布行若已随淘汰进入归档前缀，则从归档 manifest 只读补载规则，
-   **不**日常加载归档事件（其状态已在快照中）。
+   **不**日常加载归档事件（其状态已在快照中）；
+4. 最后按 §4.4 与磁盘 `rules_dir` 做规则内容对齐：预检整套规则
+   （非法即启动失败），内容不变保持同一版本，内容变化自动发布新版本。
 
 因此重启后：
 
@@ -296,14 +330,32 @@ OPEN ──ack──> ACKNOWLEDGED ──resolve──> RESOLVED（终态）
 | `default_dedup_window_s` | 300 | 规则未声明时的去重窗口 |
 | `supported_rule_versions` | (1,2) | 接受的规则格式版本 |
 | `rules_dir` | `rules` | 启动自动加载与旧流水重放取规则原文的目录 |
-| `journal_path` / `snapshot_path` | `data/…` | 流水/快照位置 |
+| `data_dir` | `data` | **本地持久化根目录** |
+| `journal_path` / `snapshot_path` | `None` → `data_dir/…` | 流水/快照位置；`None`（默认）跟随 `data_dir`，显式给定时以显式路径为准 |
 | `snapshot_every` | 1000 | 每接受 N 条事件自动固化快照（0 关闭周期快照） |
 | `retention_max_records` | 100000 | 本地历史明细条数上限（事件+终态告警+流水） |
 | `retention_max_bytes` | 64 MiB | 本地历史明细序列化字节上限 |
 | `retention_policy` | `evict_oldest` | `evict_oldest` / `reject_new` |
 | `archive_enabled` | `True` | 淘汰明细是否落长期归档 |
-| `archive_dir` | `data/archive` | 归档目录（分段 + manifest） |
+| `archive_dir` | `None` → `data_dir/archive` | 归档目录（分段 + manifest）；默认跟随 `data_dir` |
 | `archive_max_pending` | 8 | 待归档目标积压上限，满则 `archive_backpressure` |
+
+### 8.1 本地持久化位置与 `data_dir` 的关系
+
+`data_dir` 是本地持久化的根。**默认情况下（不显式指定任何位置）**，
+流水、快照、归档全部落在它下面：
+
+```
+data_dir/journal.jsonl      # append-only 流水
+data_dir/snapshot.json      # 原子快照
+data_dir/archive/           # 归档分段 + manifest
+```
+
+因此想给两套实例各留一份历史，只需让它们使用不同的 `data_dir`：
+处理记录、状态快照、归档互不串数据，重启后各自回到自己的同一份状态。
+只有在显式单独指定 `journal_path` / `snapshot_path` / `archive_dir`
+时，对应那一项才使用显式位置（其余未指定的仍跟随 `data_dir`）。
+不带 `data_dir` 的默认构造仍解析到工作目录下的 `data/`，位置与以前一致。
 
 兼容范围：新增配置全部有默认值，既有 `Config()`/`Engine(...)`/
 `create_app(...)` 构造与既有接口、状态机、拒绝码行为保持不变；旧快照
@@ -368,6 +420,35 @@ eng._archive.wait_idle()                  # 测试中等待归档落盘
 _eng, report = replay(cfg.journal_path, cfg, include_archive=True)  # 完整核对
 ```
 
+本地验证重启规则加载/版本语义与数据目录隔离：
+
+```python
+import json
+from detector.config import Config
+from detector.engine import build_engine
+from detector.errors import RuleValidationError
+
+# 两份实例只改 data_dir（不显式指定 journal/snapshot/archive）：互不串数据
+cfg_a = Config(rules_dir=Path("rules"), data_dir=Path("dataA"))
+cfg_b = Config(rules_dir=Path("rules"), data_dir=Path("dataB"))
+eng_a = build_engine(cfg_a, persist=True)   # 落 dataA/{journal,snapshot,archive}
+eng_b = build_engine(cfg_b, persist=True)   # 落 dataB/...，读不到 A 的记录
+
+# 规则内容未变时连续重启 -> revision 不变；改了 rules/*.json 内容后同样
+# 方式重启 -> 自动 current+1 发布新版本并立刻生效，历史告警仍绑定旧版本
+r1 = build_engine(cfg_a, persist=True).store.current_revision()
+json.dump(new_doc, open("rules/r1.json", "w"))
+r2 = build_engine(cfg_a, persist=True).store.current_revision()
+assert r2 == r1 + 1
+
+# 规则写坏（坏 JSON / 未知字段 / 只写了一半）-> 启动显式失败、旧状态不动
+open("rules/r1.json", "w").write('{"format_version": 2, "rules": [')
+try:
+    build_engine(cfg_a, persist=True)       # RuleValidationError，启动失败
+except RuleValidationError:
+    ...
+```
+
 测试覆盖（`tests/`）：畸形事件归类、时间非法/迟到/未来、批次上限、
 v1/v2 兼容与显式拒绝、历史版本绑定、窗口边界（299/300s）、抑制优先级、
 合并归属、乱序计数、64 线程同 id 并发只生效一次、3200 并发事件无计数
@@ -376,6 +457,11 @@ v1/v2 兼容与显式拒绝、历史版本绑定、窗口边界（299/300s）、
 - `test_restart_continuity.py`：相同启动方式重建后事件/告警/规则版本/
   去重与抑制锚点接续、重启后重复投递仍判重、终态生命周期接续、重启后
   重放核对一致；
+- `test_restart_rule_reload.py`：**规则改动后按相同方式重启自动发布
+  新版本并立刻参与判定、内容不变（含仅文件 revision 号变化）时版本
+  不多发、历史告警绑定不被改写；非法/半写规则启动显式失败且旧快照与
+  流水不被破坏、修复后续接旧状态；不同 `data_dir` 实例持久化物理隔离、
+  重启各回各状态；显式路径覆盖与默认路径不变**；
 - `test_retention.py`：`reject_new`（503/`retention_full`/零写入）与
   `evict_oldest`（`evicted>0`/水位回落/结果可区分）两条路径，淘汰后
   幂等锚点与活动去重/抑制锚点不漂移，关闭归档时内联裁剪；

@@ -288,6 +288,10 @@ def load_rules_dir(path: Path) -> tuple[list[Rule], int]:
 
     多个文件各自可声明 revision；取最大值作为规则集文档版本号，
     规则内部 ``revision`` 统一盖戳为该值（同一发布批次）。
+
+    本函数为纯读取/校验：目录下任一文件非法（坏 JSON、未知字段、
+    语义错误等）都会在触碰任何引擎状态之前抛出，调用方不会得到
+    “只加载了一半”的规则集。
     """
     files = sorted(Path(path).glob("*.json"))
     if not files:
@@ -311,6 +315,22 @@ def load_rules_dir(path: Path) -> tuple[list[Rule], int]:
         for r in all_rules
     ]
     return stamped, revision
+
+
+def rules_bundle_digest(rules: list[Rule]) -> str:
+    """规则集“内容摘要”：只取决于规则内容本身，与盖戳 revision 无关。
+
+    重启时据此判断磁盘上的规则配置相对当前生效版本是否真的变化：
+    内容不变（包括仅文件中的 revision 号变化）摘要相同 -> 不发新版本；
+    任一条规则增删改 -> 摘要变化 -> 发布新版本。
+    """
+    canonical = [
+        rule_to_dict(Rule(**{**r.__dict__, "revision": 0}))
+        for r in sorted(rules, key=lambda r: r.rule_id)
+    ]
+    from .models import input_digest
+
+    return input_digest(canonical)
 
 
 # ---- 评估 ---------------------------------------------------------------

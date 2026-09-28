@@ -95,6 +95,7 @@ class Engine:
                 "rules_published",
                 {"revision": rev, "rule_ids": [r.rule_id for r in rules],
                  "document_digest": input_digest(raw),
+                 "content_digest": rules_mod.rules_bundle_digest(rules),
                  "rules": [rules_mod.rule_to_dict(r) for r in rules]},
             )
         log.info("rules published revision=%s rules=%s", rev, [r.rule_id for r in rules])
@@ -126,8 +127,66 @@ class Engine:
                 {"revision": rev, "rule_ids": [r.rule_id for r in rules],
                  "source": str(directory),
                  "document_digest": input_digest(combined),
+                 "content_digest": rules_mod.rules_bundle_digest(rules),
                  "rules": [rules_mod.rule_to_dict(r) for r in rules]},
             )
+        return rev
+
+    def sync_rules_from_dir(self, path: Path | str | None = None,
+                            *, prefetched: list | None = None) -> int:
+        """启动期把磁盘规则目录与当前生效规则集对齐（同一种启动方式）。
+
+        语义：
+
+        - 先**完整**读取并校验整个目录（纯函数，不碰任何状态）；目录下
+          任一文件非法/写坏/只写了一半都会抛出，引擎状态与本地快照、
+          流水保持原样，既不沿用半套规则，也不会悄悄继续跑旧规则；
+        - 规则内容与当前生效版本一致（内容摘要相同，即使文件里的
+          revision 号变了）：**不**新发 revision，不多发版本；
+        - 规则内容发生变化：以 ``current_revision + 1`` 自动发布新版本
+          并写流水，立即参与后续判定；历史告警仍绑定其命中时的旧版本，
+          规则历史只增不改，不受影响；
+        - 本地尚无任何规则版本（首次启动或全新状态）：正常加载为 rev 1。
+
+        ``prefetched`` 可传入启动预检阶段已读取校验通过的规则集，复用它
+        以消除“预检后文件又被改坏”的竞态窗口。返回对齐后当前生效的
+        revision。
+        """
+        directory = Path(path) if path is not None else self.config.rules_dir
+        # 1) 完整校验：要么得到一整套合法规则，要么抛错，没有副作用
+        if prefetched is not None:
+            loaded = list(prefetched)
+        else:
+            loaded, _doc_rev = rules_mod.load_rules_dir(directory)
+        loaded_digest = rules_mod.rules_bundle_digest(loaded)
+        with self._lock:
+            active = self.store.active_rules()
+            if active and rules_mod.rules_bundle_digest(active) == loaded_digest:
+                # 内容未变：保持同一规则版本，不多发版本、不写流水
+                log.info(
+                    "rules unchanged on startup dir=%s revision=%s digest=%s",
+                    directory, self.store.current_revision(), loaded_digest)
+                return self.store.current_revision()
+            # 内容变化（或首次加载）：自动发布新版本
+            rev = self.store.current_revision() + 1
+            rules = [_restamp(r, rev) for r in loaded]
+            self.store.publish_rules(rev, rules)
+            combined = {
+                "format_version": max(r.version for r in rules),
+                "revision": rev,
+                "rule_ids": sorted(r.rule_id for r in rules),
+                "source_dir": str(directory),
+            }
+            self._write_journal(
+                "rules_published",
+                {"revision": rev, "rule_ids": [r.rule_id for r in rules],
+                 "source": str(directory),
+                 "document_digest": input_digest(combined),
+                 "content_digest": loaded_digest,
+                 "rules": [rules_mod.rule_to_dict(r) for r in rules]},
+            )
+        log.info("rules changed on startup: published revision=%s rules=%s",
+                 rev, [r.rule_id for r in rules])
         return rev
 
     # ------------------------------------------------------------------ #
@@ -757,9 +816,12 @@ class Engine:
         """崩溃恢复：把内存流水中属于已淘汰明细、尚未被已提交归档覆盖的
         连续前缀重新补归档。
 
-        判定：从最小 seq 开始，若 ``event_accepted`` 对应明细已不在本地
-        （已淘汰），则该位置属于待补归档前缀；遇到第一条明细仍在本地的
-        事件即停止（其后是正常 live 尾）。非事件行随前缀一起归档。
+        判定：只看 ``event_accepted`` 行——开头若就是明细仍在本地的事件，
+        说明不存在已淘汰前缀（其后的 rules_published 等控制行是正常 live
+        数据，不能把它们误当孤儿前缀归档，否则同 seq 会同时存在于归档与
+        live 流水，全量重放判 seq 重叠）；一旦遇到明细已不在本地（已淘汰）
+        的事件，从该行到连续缺失明细区间的末尾都属于待补归档前缀，中间的
+        非事件行随前缀一起归档；再遇到明细仍在本地的事件即停止。
         """
         if self._archive is None:
             return
@@ -769,12 +831,23 @@ class Engine:
                 e for e in self.store.journal()
                 if e.seq > committed and e.kind != "history_evicted"]
             watermark = committed
+            in_evicted_prefix = False
             for entry in candidates:
                 if entry.kind == "event_accepted":
                     eid = entry.payload.get("event_id")
-                    if eid in self.store._events:  # noqa: SLF001
-                        break  # 明细仍在本地：前缀到此为止
-                watermark = entry.seq
+                    missing = eid not in self.store._events  # noqa: SLF001
+                    if not missing and not in_evicted_prefix:
+                        # 开头第一个事件明细就在本地：没有已淘汰前缀
+                        return
+                    if missing:
+                        in_evicted_prefix = True
+                        watermark = entry.seq
+                        continue
+                    # 缺失前缀之后第一条明细仍在本地：前缀到此结束
+                    break
+                # 非事件行：只有已确认处于已淘汰前缀内时才随之前进
+                if in_evicted_prefix:
+                    watermark = entry.seq
             if watermark <= committed:
                 return
             self._archive.submit(watermark, self.config.archive_max_pending)
@@ -856,16 +929,33 @@ def build_engine(
 ) -> Engine:
     """构造引擎；持久化开启时先做启动恢复（快照 + 流水尾）。
 
-    autoload 时从 rules_dir 加载初始规则（目录可不存在）；若本地状态中
-    已有规则版本（重启接续），不重复加载以免冲突。
+    启动期规则语义（同一种启动方式，无需额外开关）：
+
+    1. ``rules_dir`` 存在时，先在**任何状态恢复/落盘之前**完整读取并
+       校验整个目录——纯校验、零副作用；任一规则文件非法/写坏/只写了
+       一半都在此显式抛错，启动失败，原有快照与流水原封不动，不会
+       沿用旧规则继续跑，也不会出现只加载一半的半套规则；
+    2. 随后从本地快照 + 流水恢复（persist 时）；
+    3. 最后把磁盘规则内容与当前生效版本对齐：内容一致则保持同一
+       revision（不多发版本），内容变化则自动发布 current+1 新版本，
+       立即参与后续判定（历史告警仍绑定命中时的旧版本）。
+
+    规则目录不存在时跳过规则步骤（用于嵌入/测试后再手工发布）。
     """
-    engine = Engine(config, persist=persist)
-    recovered = False
+    cfg = config or Config()
+    rules_dir = cfg.rules_dir
+    # 1) 启动预检：非法配置在构造引擎（含归档目录初始化等任何 IO）之前失败。
+    #    预读出的整套合法规则直接复用于后续对齐，消除预检后被改坏的竞态。
+    prefetched = None
+    if autoload and rules_dir.exists():
+        prefetched, _rev = rules_mod.load_rules_dir(rules_dir)
+    engine = Engine(cfg, persist=persist)
+    # 2) 重启接续：快照 + 流水尾（无状态时为 no-op）
     if persist:
-        recovered = engine.restore_on_startup()
-    if autoload and engine.config.rules_dir.exists():
-        if not recovered and engine.store.current_revision() == 0:
-            engine.load_rules_from_dir()
+        engine.restore_on_startup()
+    # 3) 规则内容对齐：内容不变不发版本；变化才发布新版本
+    if prefetched is not None:
+        engine.sync_rules_from_dir(rules_dir, prefetched=prefetched)
     return engine
 
 

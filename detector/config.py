@@ -5,6 +5,10 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
+# 未显式指定位置的哨兵：None 表示跟随 data_dir 解析，
+# 只有调用方显式给出路径时才覆盖（不同 data_dir 的实例互不串数据）。
+_USE_DATA_DIR = None
+
 
 @dataclass(frozen=True)
 class Config:
@@ -30,9 +34,11 @@ class Config:
     rules_dir: Path = Path("rules")
     data_dir: Path = Path("data")
 
-    # 持久化/重放
-    journal_path: Path = Path("data/journal.jsonl")
-    snapshot_path: Path = Path("data/snapshot.json")
+    # 持久化/重放。
+    # None（默认）= 跟随 data_dir：journal -> data_dir/journal.jsonl、
+    # snapshot -> data_dir/snapshot.json。显式指定则用显式位置。
+    journal_path: Path | None = _USE_DATA_DIR
+    snapshot_path: Path | None = _USE_DATA_DIR
     snapshot_every: int = 1000          # 每处理 N 条事件自动落一次快照
 
     # 有界保留：本地历史明细（归一事件明细 + 已终态告警明细 + 流水明细）
@@ -47,6 +53,17 @@ class Config:
     # 归档：被淘汰明细的长期本地留存（JSONL 分段 + manifest）。
     # 日常查询/运行不加载归档；仅显式重放/重建时纳入。
     archive_enabled: bool = True
-    # None 表示 data_dir/archive；显式给定时按给定路径
-    archive_dir: Path | None = None
+    # None（默认）= data_dir/archive；显式给定时按给定路径
+    archive_dir: Path | None = _USE_DATA_DIR
     archive_max_pending: int = 8        # 待归档目标积压上限；满则拒绝新摄入
+
+    def __post_init__(self) -> None:
+        """data_dir 是本地持久化的根：未显式指定的位置一律跟随它。"""
+        if self.journal_path is _USE_DATA_DIR or self.journal_path is None:
+            object.__setattr__(self, "journal_path",
+                               self.data_dir / "journal.jsonl")
+        if self.snapshot_path is _USE_DATA_DIR or self.snapshot_path is None:
+            object.__setattr__(self, "snapshot_path",
+                               self.data_dir / "snapshot.json")
+        if self.archive_dir is _USE_DATA_DIR:
+            object.__setattr__(self, "archive_dir", self.data_dir / "archive")
